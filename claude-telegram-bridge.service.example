@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code Telegram Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+Environment=PATH=/home/__USER__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=TELEGRAM_BOT_TOKEN=__BOT_TOKEN__
+Environment=OWNER_ID=__OWNER_ID__
+Environment=BRIDGE_WORKDIR=/home/__USER__
+ExecStart=/usr/bin/python3 __INSTALL_DIR__/bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

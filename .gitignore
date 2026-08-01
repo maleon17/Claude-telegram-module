@@ -1,0 +1,14 @@
+# Runtime state -- per-deployment, never shared
+state*.json
+whitelist.txt
+accounts/
+uploads_*/
+__pycache__/
+*.pyc
+
+# Real systemd units (contain live bot tokens) -- only *.service.example is tracked
+claude-jarvis-bridge*.service
+claude-telegram.service
+
+# Personal, unrelated work-in-progress -- not part of this project
+jarvis-ask/
