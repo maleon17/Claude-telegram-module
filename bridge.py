@@ -1027,13 +1027,37 @@ def run_claude(
                                     c.get("text", "") for c in result_content if isinstance(c, dict)
                                 )
                             result_content = str(result_content)
-                            icon = "❌" if is_error else "✅"
-                            label = f"{icon} {'Ошибка' if is_error else 'Результат'}"
-                            preview = result_content.strip()[:400]
-                            log_lines.append(f"{label}:\n```\n{preview}\n```")
+
+                            # A command can print real output and still fail
+                            # (e.g. `echo ok; exit 1`) -- Claude Code merges
+                            # that into one "Exit code N\n<output>" string
+                            # with no stdout/stderr split at all. Pull the
+                            # output out and show it first, exit code after,
+                            # instead of dumping everything under "Ошибка".
+                            exit_match = (
+                                re.match(r"^Exit code (\d+)\n?(.*)$", result_content, re.DOTALL)
+                                if is_error else None
+                            )
+                            log_parts = []
+                            res_blocks = []
+                            if exit_match:
+                                exit_code, output = exit_match.group(1), exit_match.group(2).strip()
+                                if output:
+                                    preview = output[:400]
+                                    log_parts.append(f"Вывод:\n```\n{preview}\n```")
+                                    res_blocks.append(("Вывод", _draft_clean(preview)))
+                                log_parts.append(f"❌ Ошибка:\n```\nExit code {exit_code}\n```")
+                                res_blocks.append(("❌ Ошибка", f"Exit code {exit_code}"))
+                            else:
+                                icon = "❌" if is_error else "✅"
+                                label = f"{icon} {'Ошибка' if is_error else 'Результат'}"
+                                preview = result_content.strip()[:400]
+                                log_parts.append(f"{label}:\n```\n{preview}\n```")
+                                res_blocks.append((label, _draft_clean(preview)))
+                            log_lines.append("\n".join(log_parts))
                             # Result of the CURRENT command: append below
                             # it, don't clear draft_cmd.
-                            draft_res_blocks = [(label, _draft_clean(preview))]
+                            draft_res_blocks = res_blocks
                         flush_draft(force=True)
                 continue
 
