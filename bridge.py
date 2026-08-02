@@ -25,7 +25,7 @@ import uuid
 import glob
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from telegram_format import format_message, strip_mdv2
+from telegram_format import format_message, strip_mdv2, escape_mdv2
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER_ID = os.environ["OWNER_ID"]
@@ -871,7 +871,13 @@ def run_claude(
             return
         lines = []
         if draft_thought:
-            lines.append(draft_thought)
+            # Unlike draft_cmd/draft_res (inside a code span, where regular
+            # punctuation needs no escaping), this is raw top-level
+            # MarkdownV2 text -- real sentences are full of unescaped
+            # ".,()-!" etc., which made sendMessageDraft fail its parse
+            # silently (no error is ever checked) and just freeze on
+            # whatever the last successful frame was.
+            lines.append(escape_mdv2(draft_thought))
         if draft_cmd:
             # Triple backticks (a "pre" entity) instead of single -- single
             # backtick is just inline "code" (tap-to-copy, no distinct
@@ -881,12 +887,21 @@ def run_claude(
             if draft_res:
                 lines.append(f"```\n{draft_res}\n```")
         text = "\n".join(lines) if lines else "Думаю"
-        tg_call("sendMessageDraft", {
+        r = tg_call("sendMessageDraft", {
             "chat_id": chat_id,
             "draft_id": chat_id,
             "parse_mode": "MarkdownV2",
             "text": text,
         })
+        if not r.get("ok"):
+            # A parse failure here used to just freeze the draft on its
+            # last successful frame with no indication anything was wrong.
+            # Fall back to plain text (no entities) so it keeps moving.
+            tg_call("sendMessageDraft", {
+                "chat_id": chat_id,
+                "draft_id": chat_id,
+                "text": strip_mdv2(text).replace("```", ""),
+            })
         last_draft_edit = now
 
     try:
