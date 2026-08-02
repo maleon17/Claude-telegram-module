@@ -68,6 +68,12 @@ active_procs = {}
 # --resume calls onto the same session).
 busy_chats = set()
 
+# Guards every read-modify-write on the shared `state` dict + its on-disk
+# save. Without this, two chats messaging concurrently could each load,
+# mutate, and save `state` in an interleaved order, silently losing one
+# side's update (last writer wins on the whole file, not just their key).
+state_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # Multi-tenant accounts: each whitelisted chat_id other than OWNER_ID gets its
 # own isolated CLAUDE_CONFIG_DIR (own OAuth login, own Pro subscription, own
@@ -271,7 +277,7 @@ def send_attachment(chat_id, path, caption=None):
         send_message(chat_id, f"Не удалось отправить `{path}`: {r.get('description', r)}")
 
 
-def download_telegram_file(file_id, filename_hint=None):
+def download_telegram_file(chat_id, file_id, filename_hint=None):
     r = tg_call("getFile", {"file_id": file_id})
     if not r.get("ok"):
         return None
@@ -279,9 +285,10 @@ def download_telegram_file(file_id, filename_hint=None):
     url = f"{FILE_API_BASE}/{file_path}"
     name = filename_hint or os.path.basename(file_path) or f"{file_id}.bin"
     name = re.sub(r"[^\w.\-]", "_", name)
-    local_path = os.path.join(UPLOADS_DIR, f"{int(time.time() * 1000)}_{name}")
+    chat_dir = os.path.join(UPLOADS_DIR, str(chat_id))
+    local_path = os.path.join(chat_dir, f"{int(time.time() * 1000)}_{name}")
     try:
-        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        os.makedirs(chat_dir, exist_ok=True)
         with urllib.request.urlopen(url, timeout=60) as resp, open(local_path, "wb") as f:
             f.write(resp.read())
         return local_path
@@ -513,17 +520,19 @@ def get_session(state, chat_id):
 
 
 def set_session(state, chat_id, session_id):
-    entry = state.setdefault(str(chat_id), {})
-    entry["session_id"] = session_id
-    entry["updated_at"] = time.time()
-    save_state(state)
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        entry["session_id"] = session_id
+        entry["updated_at"] = time.time()
+        save_state(state)
 
 
 def clear_session(state, chat_id):
-    entry = state.get(str(chat_id))
-    if entry:
-        entry.pop("session_id", None)
-        save_state(state)
+    with state_lock:
+        entry = state.get(str(chat_id))
+        if entry:
+            entry.pop("session_id", None)
+            save_state(state)
 
 
 def _empty_usage():
@@ -542,33 +551,34 @@ def _empty_usage():
 def add_usage(state, chat_id, session_id, result_event):
     if not session_id:
         return
-    entry = state.setdefault(str(chat_id), {})
-    sessions = entry.setdefault("sessions", {})
-    usage = sessions.setdefault(session_id, _empty_usage())
-    usage.setdefault("by_model", {})
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        sessions = entry.setdefault("sessions", {})
+        usage = sessions.setdefault(session_id, _empty_usage())
+        usage.setdefault("by_model", {})
 
-    usage["calls"] += 1
-    usage["cost_usd"] += result_event.get("total_cost_usd") or 0.0
-    u = result_event.get("usage") or {}
-    usage["input_tokens"] += u.get("input_tokens") or 0
-    usage["output_tokens"] += u.get("output_tokens") or 0
-    usage["cache_read_tokens"] += u.get("cache_read_input_tokens") or 0
-    usage["cache_creation_tokens"] += u.get("cache_creation_input_tokens") or 0
-    usage["last_context_tokens"] = (
-        (u.get("input_tokens") or 0)
-        + (u.get("cache_read_input_tokens") or 0)
-        + (u.get("cache_creation_input_tokens") or 0)
-    )
-
-    for model_name, mu in (result_event.get("modelUsage") or {}).items():
-        bm = usage["by_model"].setdefault(
-            model_name, {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+        usage["calls"] += 1
+        usage["cost_usd"] += result_event.get("total_cost_usd") or 0.0
+        u = result_event.get("usage") or {}
+        usage["input_tokens"] += u.get("input_tokens") or 0
+        usage["output_tokens"] += u.get("output_tokens") or 0
+        usage["cache_read_tokens"] += u.get("cache_read_input_tokens") or 0
+        usage["cache_creation_tokens"] += u.get("cache_creation_input_tokens") or 0
+        usage["last_context_tokens"] = (
+            (u.get("input_tokens") or 0)
+            + (u.get("cache_read_input_tokens") or 0)
+            + (u.get("cache_creation_input_tokens") or 0)
         )
-        bm["cost_usd"] += mu.get("costUSD") or 0.0
-        bm["input_tokens"] += mu.get("inputTokens") or 0
-        bm["output_tokens"] += mu.get("outputTokens") or 0
 
-    save_state(state)
+        for model_name, mu in (result_event.get("modelUsage") or {}).items():
+            bm = usage["by_model"].setdefault(
+                model_name, {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
+            )
+            bm["cost_usd"] += mu.get("costUSD") or 0.0
+            bm["input_tokens"] += mu.get("inputTokens") or 0
+            bm["output_tokens"] += mu.get("outputTokens") or 0
+
+        save_state(state)
 
 
 def get_usage(state, chat_id, session_id):
@@ -582,12 +592,13 @@ def get_model(state, chat_id):
 
 
 def set_model(state, chat_id, model):
-    entry = state.setdefault(str(chat_id), {})
-    if model:
-        entry["model"] = model
-    else:
-        entry.pop("model", None)
-    save_state(state)
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        if model:
+            entry["model"] = model
+        else:
+            entry.pop("model", None)
+        save_state(state)
 
 
 def get_permission_mode(state, chat_id):
@@ -596,12 +607,13 @@ def get_permission_mode(state, chat_id):
 
 
 def set_permission_mode(state, chat_id, mode):
-    entry = state.setdefault(str(chat_id), {})
-    if mode and mode != "bypass":
-        entry["permission_mode"] = mode
-    else:
-        entry.pop("permission_mode", None)
-    save_state(state)
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        if mode and mode != "bypass":
+            entry["permission_mode"] = mode
+        else:
+            entry.pop("permission_mode", None)
+        save_state(state)
 
 
 def get_workspace(state, chat_id):
@@ -609,18 +621,20 @@ def get_workspace(state, chat_id):
 
 
 def set_workspace(state, chat_id, path):
-    entry = state.setdefault(str(chat_id), {})
-    if path:
-        entry["workspace"] = path
-    else:
-        entry.pop("workspace", None)
-    save_state(state)
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        if path:
+            entry["workspace"] = path
+        else:
+            entry.pop("workspace", None)
+        save_state(state)
 
 
 def set_pending_prompt(state, chat_id, prompt):
-    entry = state.setdefault(str(chat_id), {})
-    entry["pending_prompt"] = prompt
-    save_state(state)
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        entry["pending_prompt"] = prompt
+        save_state(state)
 
 
 def get_pending_prompt(state, chat_id):
@@ -628,10 +642,11 @@ def get_pending_prompt(state, chat_id):
 
 
 def clear_pending_prompt(state, chat_id):
-    entry = state.get(str(chat_id))
-    if entry:
-        entry.pop("pending_prompt", None)
-        save_state(state)
+    with state_lock:
+        entry = state.get(str(chat_id))
+        if entry:
+            entry.pop("pending_prompt", None)
+            save_state(state)
 
 
 def get_account_status(state, chat_id):
@@ -642,12 +657,13 @@ def get_account_status(state, chat_id):
 
 
 def set_account_status(state, chat_id, status):
-    entry = state.setdefault(str(chat_id), {})
-    if status:
-        entry["account_status"] = status
-    else:
-        entry.pop("account_status", None)
-    save_state(state)
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        if status:
+            entry["account_status"] = status
+        else:
+            entry.pop("account_status", None)
+        save_state(state)
 
 
 def fetch_account_limits(config_dir=None):
@@ -825,14 +841,19 @@ def run_claude(
     denials = []
     written_files = []
 
-    # Draft rendering state: a tool call's command stays on screen once its
-    # result arrives (appended below, not replacing it) -- both as their own
-    # code spans -- so there's time to actually see each. Only the NEXT tool
-    # call clears both. Plain "thinking" text (no tool call) shows with no
-    # code formatting at all.
+    # Draft rendering state, two levels:
+    # - draft_thought: the current "thinking"/text block, plain (no code
+    #   formatting). Stays as an anchor across however many tool calls
+    #   happen under it.
+    # - draft_cmd / draft_res: the current tool call + its result, each
+    #   their own code block, overwriting the previous pair the same way
+    #   as before -- but scoped UNDER the current thought.
+    # A new thought clears everything (old thought + whatever tool
+    # cmd/result was showing) and starts fresh; a new tool call only
+    # clears the previous cmd/result, leaving the thought in place.
+    draft_thought = None
     draft_cmd = None
     draft_res = None
-    draft_plain = None
 
     def _draft_clean(s, limit=200):
         s = strip_mdv2(s)
@@ -848,19 +869,18 @@ def run_claude(
         now = time.time()
         if not force and (now - last_draft_edit) < EDIT_THROTTLE_S:
             return
+        lines = []
+        if draft_thought:
+            lines.append(draft_thought)
         if draft_cmd:
             # Triple backticks (a "pre" entity) instead of single -- single
             # backtick is just inline "code" (tap-to-copy, no distinct
             # visual box); pre blocks get their own background, matching
             # what the final persisted process message already does.
-            lines = [f"```\n{draft_cmd}\n```"]
+            lines.append(f"```\n{draft_cmd}\n```")
             if draft_res:
                 lines.append(f"```\n{draft_res}\n```")
-            text = "\n".join(lines)
-        elif draft_plain:
-            text = draft_plain
-        else:
-            text = "Думаю"
+        text = "\n".join(lines) if lines else "Думаю"
         tg_call("sendMessageDraft", {
             "chat_id": chat_id,
             "draft_id": chat_id,
@@ -899,24 +919,32 @@ def run_claude(
                         tool_input = block.get("input", {})
                         log_lines.append(tool_call_line(name, tool_input))
                         # New tool call: clear the previous command+result
-                        # pair entirely, start a fresh one.
+                        # pair, but leave the current thought (if any) in
+                        # place -- tool calls happen "under" a thought.
                         draft_cmd = _draft_clean(tool_call_line(name, tool_input))
                         draft_res = None
-                        draft_plain = None
                         flush_draft(force=True)
                         if name == "Write":
                             fp = tool_input.get("file_path")
                             if fp:
                                 written_files.append(fp)
-                    elif block.get("type") == "text":
-                        text = block.get("text", "")
+                    elif block.get("type") in ("text", "thinking"):
+                        # "text" is visible reasoning/answer text; "thinking"
+                        # is an extended-thinking block (separate field name,
+                        # `thinking` not `text`) -- both are a new "thought"
+                        # for draft purposes, and both clear everything
+                        # (previous thought + whatever tool cmd/result was
+                        # showing under it), since a new thought starts a new
+                        # episode.
+                        text = block.get("text") or block.get("thinking") or ""
                         if text.strip():
-                            log_lines.append(f"💬 {text}")
-                            last_text_log_index = len(log_lines) - 1
-                            last_text_log_raw = text
+                            if block.get("type") == "text":
+                                log_lines.append(f"💬 {text}")
+                                last_text_log_index = len(log_lines) - 1
+                                last_text_log_raw = text
+                            draft_thought = _draft_clean(text, limit=300)
                             draft_cmd = None
                             draft_res = None
-                            draft_plain = _draft_clean(text, limit=300)
                             flush_draft(force=True)
                 flush_draft()
                 continue
@@ -1629,14 +1657,14 @@ def main():
                 attachment_note = ""
                 if photo:
                     largest = photo[-1]
-                    local_path = download_telegram_file(largest["file_id"])
+                    local_path = download_telegram_file(chat_id, largest["file_id"])
                     if local_path:
                         attachment_note += f"\n\n[Прикреплено изображение: {local_path}]"
                     else:
                         send_message(chat_id, "Не удалось скачать изображение.")
                 if document:
                     local_path = download_telegram_file(
-                        document["file_id"], filename_hint=document.get("file_name")
+                        chat_id, document["file_id"], filename_hint=document.get("file_name")
                     )
                     if local_path:
                         attachment_note += f"\n\n[Прикреплён файл: {local_path}]"
