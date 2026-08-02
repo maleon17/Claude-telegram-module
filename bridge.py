@@ -1009,12 +1009,12 @@ def run_claude(
                             res_blocks = []
                             if stdout_text:
                                 preview = stdout_text[:400]
-                                log_parts.append(f"✅ Stdout:\n```\n{preview}\n```")
-                                res_blocks.append(("✅ Stdout", _draft_clean(preview)))
+                                log_parts.append(f"✅ StdOut:\n```\n{preview}\n```")
+                                res_blocks.append(("✅ StdOut", _draft_clean(preview)))
                             if stderr_text:
                                 preview = stderr_text[:400]
-                                log_parts.append(f"❌ Stderr:\n```\n{preview}\n```")
-                                res_blocks.append(("❌ Stderr", _draft_clean(preview)))
+                                log_parts.append(f"❌ StdErr:\n```\n{preview}\n```")
+                                res_blocks.append(("❌ StdErr", _draft_clean(preview)))
                             if not log_parts:
                                 icon = "❌" if is_error else "✅"
                                 log_parts.append(f"{icon} (пусто)")
@@ -1044,10 +1044,10 @@ def run_claude(
                                 exit_code, output = exit_match.group(1), exit_match.group(2).strip()
                                 if output:
                                     preview = output[:400]
-                                    log_parts.append(f"Вывод:\n```\n{preview}\n```")
-                                    res_blocks.append(("Вывод", _draft_clean(preview)))
-                                log_parts.append(f"❌ Ошибка:\n```\nExit code {exit_code}\n```")
-                                res_blocks.append(("❌ Ошибка", f"Exit code {exit_code}"))
+                                    log_parts.append(f"✅ StdOut:\n```\n{preview}\n```")
+                                    res_blocks.append(("✅ StdOut", _draft_clean(preview)))
+                                log_parts.append(f"❌ StdErr:\n```\nExit code {exit_code}\n```")
+                                res_blocks.append(("❌ StdErr", f"Exit code {exit_code}"))
                             else:
                                 icon = "❌" if is_error else "✅"
                                 label = f"{icon} {'Ошибка' if is_error else 'Результат'}"
