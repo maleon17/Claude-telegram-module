@@ -35,6 +35,7 @@ STATE_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"),
 )
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
+SERVICE_NAME = os.environ.get("SERVICE_NAME")  # this instance's own systemd unit, for /restart
 PROJECTS_DIR = os.path.join(
     os.path.expanduser("~/.claude/projects"), WORKDIR.replace("/", "-")
 )
@@ -67,6 +68,10 @@ active_procs = {}
 # chat_ids with a turn currently in flight (guards against overlapping
 # --resume calls onto the same session).
 busy_chats = set()
+# Mutable box so the restart-watcher background thread (see
+# _restart_watcher_loop) can read main()'s current getUpdates offset
+# without needing it passed in explicitly.
+current_offset = [0]
 
 # Guards every read-modify-write on the shared `state` dict + its on-disk
 # save. Without this, two chats messaging concurrently could each load,
@@ -85,6 +90,7 @@ state_lock = threading.Lock()
 WHITELIST_FILE = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)), "whitelist.txt"
 )
+RESTART_SIGNAL_FILE = STATE_FILE + ".restart_signal"
 ACCOUNTS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)), "accounts"
 )
@@ -666,6 +672,76 @@ def set_account_status(state, chat_id, status):
         save_state(state)
 
 
+def set_pending_restart(state, chat_id, message_id):
+    # Not per-chat -- this whole bridge instance is restarting, tracked
+    # once at the top level so the fresh process (after systemctl restart
+    # kills this one) knows which message to edit to "done" on startup.
+    with state_lock:
+        state["_pending_restart"] = {"chat_id": chat_id, "message_id": message_id}
+        save_state(state)
+
+
+def pop_pending_restart(state):
+    with state_lock:
+        info = state.pop("_pending_restart", None)
+        if info:
+            save_state(state)
+        return info
+
+
+def request_restart(chat_id):
+    # A dedicated file, not a key in `state` -- the running process holds
+    # `state` purely in memory after its own startup load, so an external
+    # write to state.json (e.g. from a one-off script simulating this call)
+    # would never be seen until the process itself happened to reload it,
+    # which it never does. This file is freshly checked from disk every
+    # loop iteration instead, so an external trigger actually works.
+    with open(RESTART_SIGNAL_FILE, "w") as f:
+        json.dump({"chat_id": chat_id}, f)
+
+
+def pop_restart_request():
+    if not os.path.exists(RESTART_SIGNAL_FILE):
+        return None
+    try:
+        with open(RESTART_SIGNAL_FILE) as f:
+            info = json.load(f)
+    except Exception:
+        info = None
+    try:
+        os.remove(RESTART_SIGNAL_FILE)
+    except FileNotFoundError:
+        pass
+    return info
+
+
+def _restart_watcher_loop(state):
+    """Runs in its own thread, checked on its own clock (every 1s) instead
+    of piggybacking on the getUpdates cycle. That matters: if messages keep
+    arriving back-to-back, busy_chats can go empty and get re-populated by
+    the next message before the main loop ever gets back around to its own
+    post-batch check -- this thread catches the gap regardless of whether
+    a new message happens to land right after."""
+    while True:
+        time.sleep(1)
+        if busy_chats:
+            continue
+        restart_req = pop_restart_request()
+        if not restart_req:
+            continue
+        r_chat_id = restart_req["chat_id"]
+        rr = send_message(
+            r_chat_id, "🔄 Идёт перезагрузка, ничего не делайте пока процесс не будет завершён...",
+        )
+        r_message_id = (rr.get("result") or {}).get("message_id") if rr.get("ok") else None
+        if r_message_id:
+            set_pending_restart(state, r_chat_id, r_message_id)
+        # See the offset-flush comment in main() for why this is needed --
+        # same reasoning applies here.
+        tg_call("getUpdates", {"offset": current_offset[0], "timeout": 0})
+        subprocess.Popen(["sudo", "-n", "systemctl", "restart", SERVICE_NAME])
+
+
 def fetch_account_limits(config_dir=None):
     """Shell out to Claude Code's own /usage slash command for real account-level
     5-hour/weekly rate limit info. Runs as a standalone call (no --resume) so it
@@ -1151,10 +1227,11 @@ COMMANDS = [
     ("approve", "Разрешить заблокированное действие (once/session)"),
     ("deny", "Отклонить заблокированное действие"),
     ("login", "Переподключить свой аккаунт Claude"),
+    ("restart", "Перезапустить бота (только для владельца)"),
 ]
 
 
-def handle_command(chat_id, text, state):
+def handle_command(chat_id, text, state, offset=None):
     cmd, _, arg = text.partition(" ")
     cmd = cmd.lower().strip().lstrip("/.")
     arg = arg.strip()
@@ -1343,6 +1420,25 @@ def handle_command(chat_id, text, state):
             return True
         start_login(chat_id, state)
         send_message(chat_id, "Начинаю переподключение аккаунта Claude...")
+        return True
+
+    if cmd == "restart":
+        if str(chat_id) != str(OWNER_ID):
+            send_message(chat_id, "Перезапуск доступен только владельцу.")
+            return True
+        if not SERVICE_NAME:
+            send_message(chat_id, "SERVICE_NAME не задан в systemd-юните — автоперезапуск недоступен.")
+            return True
+        # Don't restart immediately -- if a turn (possibly this very one) is
+        # still in flight, killing the process now would cut it off mid-
+        # answer. Just record the request; main()'s loop performs the
+        # actual restart once busy_chats is empty, so it always happens
+        # between turns, never in the middle of one.
+        request_restart(chat_id)
+        send_message(
+            chat_id,
+            "🔁 Перезапуск запланирован — выполнится, как только текущие запросы завершатся.",
+        )
         return True
 
     return False
@@ -1650,6 +1746,15 @@ def main():
     print("Claude Telegram bridge starting...", flush=True)
     register_commands()
 
+    pending_restart = pop_pending_restart(state)
+    if pending_restart:
+        edit_message(
+            pending_restart["chat_id"], pending_restart["message_id"],
+            "✅ Перезагрузка окончена, бот готов к работе.",
+        )
+
+    threading.Thread(target=_restart_watcher_loop, args=(state,), daemon=True).start()
+
     while True:
         try:
             r = tg_call(
@@ -1672,6 +1777,7 @@ def main():
 
         for update in r.get("result", []):
             offset = update["update_id"] + 1
+            current_offset[0] = offset
 
             cq = update.get("callback_query")
             if cq:
@@ -1743,7 +1849,7 @@ def main():
                     continue
 
                 if not photo and not document and text.startswith(("/", ".")):
-                    if handle_command(chat_id, text, state):
+                    if handle_command(chat_id, text, state, offset=offset):
                         continue
 
                 attachment_note = ""
