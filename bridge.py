@@ -872,8 +872,7 @@ def run_claude(
     draft_thought = None
     draft_cmd_label = None
     draft_cmd = None
-    draft_res_label = None
-    draft_res = None
+    draft_res_blocks = []  # list of (label, content) -- Bash can have both stdout and stderr
 
     def _draft_clean(s, limit=200):
         s = strip_mdv2(s)
@@ -905,9 +904,9 @@ def run_claude(
             # what the final persisted process message already does.
             lines.append(escape_mdv2(f"{draft_cmd_label}:"))
             lines.append(f"```\n{draft_cmd}\n```")
-            if draft_res:
-                lines.append(escape_mdv2(f"{draft_res_label}:"))
-                lines.append(f"```\n{draft_res}\n```")
+            for label, content in draft_res_blocks:
+                lines.append(escape_mdv2(f"{label}:"))
+                lines.append(f"```\n{content}\n```")
         text = "\n".join(lines) if lines else "Думаю"
         r = tg_call("sendMessageDraft", {
             "chat_id": chat_id,
@@ -961,8 +960,7 @@ def run_claude(
                         label, content = draft_tool_label_and_content(name, tool_input)
                         draft_cmd_label = label
                         draft_cmd = _draft_clean(content)
-                        draft_res_label = None
-                        draft_res = None
+                        draft_res_blocks = []
                         flush_draft(force=True)
                         if name == "Write":
                             fp = tool_input.get("file_path")
@@ -985,8 +983,7 @@ def run_claude(
                             draft_thought = _draft_clean(text, limit=300)
                             draft_cmd_label = None
                             draft_cmd = None
-                            draft_res_label = None
-                            draft_res = None
+                            draft_res_blocks = []
                             flush_draft(force=True)
                 flush_draft()
                 continue
@@ -995,20 +992,47 @@ def run_claude(
                 content = d.get("message", {}).get("content", [])
                 for block in content:
                     if block.get("type") == "tool_result":
-                        result_content = block.get("content", "")
-                        if isinstance(result_content, list):
-                            result_content = " ".join(
-                                c.get("text", "") for c in result_content if isinstance(c, dict)
-                            )
-                        result_content = str(result_content)
                         is_error = block.get("is_error", False)
-                        icon = "❌" if is_error else "✅"
-                        preview = result_content.strip()[:400]
-                        log_lines.append(f"{icon}\n```\n{preview}\n```")
-                        # Result of the CURRENT command: append below it,
-                        # don't clear draft_cmd.
-                        draft_res_label = f"{icon} Stderr" if is_error else f"{icon} Stdout"
-                        draft_res = _draft_clean(preview)
+                        # Bash results carry separate stdout/stderr at the
+                        # top level (tool_use_result), even when the command
+                        # succeeded overall -- e.g. warnings on stderr with
+                        # exit 0. The merged `content` field used below loses
+                        # that distinction.
+                        tur = d.get("tool_use_result")
+                        stdout_text = tur.get("stdout") if isinstance(tur, dict) else None
+                        stderr_text = tur.get("stderr") if isinstance(tur, dict) else None
+
+                        if stdout_text is not None or stderr_text is not None:
+                            stdout_text = (stdout_text or "").strip()
+                            stderr_text = (stderr_text or "").strip()
+                            log_parts = []
+                            res_blocks = []
+                            if stdout_text:
+                                preview = stdout_text[:400]
+                                log_parts.append(f"✅ Stdout:\n```\n{preview}\n```")
+                                res_blocks.append(("✅ Stdout", _draft_clean(preview)))
+                            if stderr_text:
+                                preview = stderr_text[:400]
+                                log_parts.append(f"❌ Stderr:\n```\n{preview}\n```")
+                                res_blocks.append(("❌ Stderr", _draft_clean(preview)))
+                            if not log_parts:
+                                icon = "❌" if is_error else "✅"
+                                log_parts.append(f"{icon} (пусто)")
+                            log_lines.append("\n".join(log_parts))
+                            draft_res_blocks = res_blocks
+                        else:
+                            result_content = block.get("content", "")
+                            if isinstance(result_content, list):
+                                result_content = " ".join(
+                                    c.get("text", "") for c in result_content if isinstance(c, dict)
+                                )
+                            result_content = str(result_content)
+                            icon = "❌" if is_error else "✅"
+                            preview = result_content.strip()[:400]
+                            log_lines.append(f"{icon}\n```\n{preview}\n```")
+                            # Result of the CURRENT command: append below
+                            # it, don't clear draft_cmd.
+                            draft_res_blocks = [(f"{icon} Результат", _draft_clean(preview))]
                         flush_draft(force=True)
                 continue
 
