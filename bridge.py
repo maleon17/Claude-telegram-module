@@ -783,6 +783,24 @@ def tool_call_line(name, tool_input):
     return f"🔧 {name}:\n```\n{keys_preview}\n```"
 
 
+def draft_tool_label_and_content(name, tool_input):
+    """Same tool dispatch as tool_call_line, but returns (label, content)
+    separately instead of one pre-formatted string -- for the live draft,
+    where the label sits on its own line above the code block, not baked
+    into it."""
+    if name == "Bash":
+        return "🔧 Bash", tool_input.get("command", "")
+    if name == "Read":
+        return "📖 Read", tool_input.get("file_path", "")
+    if name in ("Write", "Edit"):
+        return f"✏️ {name}", tool_input.get("file_path", "")
+    if name == "WebSearch":
+        return "🔍 WebSearch", tool_input.get("query", "")
+    if name == "WebFetch":
+        return "🌐 WebFetch", tool_input.get("url", "")
+    return f"🔧 {name}", json.dumps(tool_input)
+
+
 def run_claude(
     chat_id,
     prompt,
@@ -852,7 +870,9 @@ def run_claude(
     # cmd/result was showing) and starts fresh; a new tool call only
     # clears the previous cmd/result, leaving the thought in place.
     draft_thought = None
+    draft_cmd_label = None
     draft_cmd = None
+    draft_res_label = None
     draft_res = None
 
     def _draft_clean(s, limit=200):
@@ -883,8 +903,10 @@ def run_claude(
             # backtick is just inline "code" (tap-to-copy, no distinct
             # visual box); pre blocks get their own background, matching
             # what the final persisted process message already does.
+            lines.append(escape_mdv2(f"{draft_cmd_label}:"))
             lines.append(f"```\n{draft_cmd}\n```")
             if draft_res:
+                lines.append(escape_mdv2(f"{draft_res_label}:"))
                 lines.append(f"```\n{draft_res}\n```")
         text = "\n".join(lines) if lines else "Думаю"
         r = tg_call("sendMessageDraft", {
@@ -936,7 +958,10 @@ def run_claude(
                         # New tool call: clear the previous command+result
                         # pair, but leave the current thought (if any) in
                         # place -- tool calls happen "under" a thought.
-                        draft_cmd = _draft_clean(tool_call_line(name, tool_input))
+                        label, content = draft_tool_label_and_content(name, tool_input)
+                        draft_cmd_label = label
+                        draft_cmd = _draft_clean(content)
+                        draft_res_label = None
                         draft_res = None
                         flush_draft(force=True)
                         if name == "Write":
@@ -958,7 +983,9 @@ def run_claude(
                                 last_text_log_index = len(log_lines) - 1
                                 last_text_log_raw = text
                             draft_thought = _draft_clean(text, limit=300)
+                            draft_cmd_label = None
                             draft_cmd = None
+                            draft_res_label = None
                             draft_res = None
                             flush_draft(force=True)
                 flush_draft()
@@ -980,7 +1007,8 @@ def run_claude(
                         log_lines.append(f"{icon}\n```\n{preview}\n```")
                         # Result of the CURRENT command: append below it,
                         # don't clear draft_cmd.
-                        draft_res = _draft_clean(f"{icon} {preview}")
+                        draft_res_label = f"{icon} Stderr" if is_error else f"{icon} Stdout"
+                        draft_res = _draft_clean(preview)
                         flush_draft(force=True)
                 continue
 
