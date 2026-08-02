@@ -1435,10 +1435,11 @@ def handle_command(chat_id, text, state, offset=None):
         # actual restart once busy_chats is empty, so it always happens
         # between turns, never in the middle of one.
         request_restart(chat_id)
-        send_message(
-            chat_id,
-            "🔁 Перезапуск запланирован — выполнится, как только текущие запросы завершатся.",
-        )
+        if busy_chats:
+            send_message(
+                chat_id,
+                "🔁 Перезапуск запланирован — выполнится, как только текущие запросы завершатся.",
+            )
         return True
 
     return False
