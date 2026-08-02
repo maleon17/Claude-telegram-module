@@ -1028,11 +1028,12 @@ def run_claude(
                                 )
                             result_content = str(result_content)
                             icon = "❌" if is_error else "✅"
+                            label = f"{icon} {'Ошибка' if is_error else 'Результат'}"
                             preview = result_content.strip()[:400]
-                            log_lines.append(f"{icon}\n```\n{preview}\n```")
+                            log_lines.append(f"{label}:\n```\n{preview}\n```")
                             # Result of the CURRENT command: append below
                             # it, don't clear draft_cmd.
-                            draft_res_blocks = [(f"{icon} Результат", _draft_clean(preview))]
+                            draft_res_blocks = [(label, _draft_clean(preview))]
                         flush_draft(force=True)
                 continue
 
