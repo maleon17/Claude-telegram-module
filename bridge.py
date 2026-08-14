@@ -1170,7 +1170,18 @@ def run_claude(
                         flush_draft(force=True)
                         if name == "Write":
                             fp = tool_input.get("file_path")
-                            if fp:
+                            # Exclude anything under ~/.claude/ (auto-memory,
+                            # session/project bookkeeping, settings) -- these
+                            # are Claude's own internal writes, never a
+                            # deliverable for the chat. Without this, e.g. a
+                            # memory-file save gets auto-attached to the next
+                            # reply as if it were a file the user asked for
+                            # (caught live 2026-08-13: a memory note about an
+                            # unrelated deploy mistake showed up as a random
+                            # attachment mid-conversation).
+                            if fp and not os.path.abspath(os.path.expanduser(fp)).startswith(
+                                os.path.expanduser("~/.claude/") + os.sep
+                            ):
                                 written_files.append(fp)
                     elif block.get("type") in ("text", "thinking"):
                         # "text" is visible reasoning/answer text; "thinking"
