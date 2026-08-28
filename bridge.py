@@ -77,7 +77,7 @@ FILE_PATH_RE = re.compile(
 )
 
 # chat_id -> {"proc", "signature", "reader_thread", "last_activity",
-# "pending_prompt"} for that chat's PERSISTENT `claude --input-format=
+# "original_prompt"} for that chat's PERSISTENT `claude --input-format=
 # stream-json` process (2026-08-18 migration off spawn-per-message -- see
 # _ensure_chat_process/_chat_reader_loop). Only 2 real users on this
 # instance (owner + father), so holding one live process per chat
@@ -1240,7 +1240,7 @@ def _compact_draft_watchdog(chat_id, ts):
             return
 
 
-def _deliver_turn_result(chat_id, state, ts, prompt, stopped=False):
+def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
     """Everything that used to happen after run_claude() returned, plus
     dispatch_turn()'s own tail (attachments, denial handling) -- merged
     here because in the persistent-process model EVERY turn, whether we
@@ -1294,7 +1294,13 @@ def _deliver_turn_result(chat_id, state, ts, prompt, stopped=False):
             send_rich(chat_id, rich_text)
 
     if ts["current_session_id"]:
-        set_session(state, chat_id, ts["current_session_id"])
+        with chat_procs_lock:
+            is_current_proc = chat_procs.get(chat_id, {}).get("proc") is proc
+        # A /new or /resume may already have detached this process while
+        # its reader was draining the old stdout. That stale result must
+        # not restore the session the command just replaced.
+        if is_current_proc:
+            set_session(state, chat_id, ts["current_session_id"])
 
     if stopped:
         # This path fires whenever the persistent process ends with a turn
@@ -1579,23 +1585,26 @@ def _chat_reader_loop(chat_id, state, record):
                 ts["final_text"] = d.get("result", "")
                 ts["denials"].extend(d.get("permission_denials") or [])
                 add_usage(state, chat_id, ts["current_session_id"], d)
-                prompt = record.pop("pending_prompt", None)
+                with record["write_lock"]:
+                    prompt = record["original_prompt"]
+                    record["original_prompt"] = None
                 try:
-                    _deliver_turn_result(chat_id, state, ts, prompt, stopped=False)
+                    _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False)
                 except Exception:
                     print(traceback.format_exc()[-1500:], flush=True)
-                busy_chats.discard(chat_id)
+                with chat_procs_lock:
+                    if chat_procs.get(chat_id, {}).get("proc") is proc:
+                        busy_chats.discard(chat_id)
                 ts = _new_turn_accumulator(state, chat_id)
                 record["ts"] = ts
                 continue
     except Exception:
         print(f"chat_reader error ({chat_id}):\n" + traceback.format_exc()[-1500:], flush=True)
     finally:
-        with chat_procs_lock:
-            if chat_procs.get(chat_id, {}).get("proc") is proc:
-                chat_procs.pop(chat_id, None)
-        pending_prompt = record.pop("pending_prompt", None)
-        if pending_prompt is not None:
+        with record["write_lock"]:
+            original_prompt = record["original_prompt"]
+            record["original_prompt"] = None
+        if original_prompt is not None:
             # Process ended (killed via /stop, torn down for a settings
             # change, or crashed) while a turn was genuinely in flight --
             # delivers the same "⏹ Остановлено" UX the old spawn-per-
@@ -1603,10 +1612,13 @@ def _chat_reader_loop(chat_id, state, record):
             # (e.g. the idle reaper stopped a genuinely idle process),
             # there's nothing to report.
             try:
-                _deliver_turn_result(chat_id, state, ts, pending_prompt, stopped=True)
+                _deliver_turn_result(chat_id, state, ts, original_prompt, proc, stopped=True)
             except Exception:
                 print(traceback.format_exc()[-1500:], flush=True)
-        busy_chats.discard(chat_id)
+        with chat_procs_lock:
+            if chat_procs.get(chat_id, {}).get("proc") is proc:
+                chat_procs.pop(chat_id, None)
+                busy_chats.discard(chat_id)
         if proc.poll() is None:
             proc.kill()
 
@@ -1647,7 +1659,7 @@ def _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, 
         "proc": proc,
         "signature": _chat_process_signature(model, permission_mode, workspace, config_dir),
         "last_activity": time.time(),
-        "pending_prompt": None,
+        "original_prompt": None,
         "write_lock": threading.Lock(),
     }
     with chat_procs_lock:
@@ -1664,6 +1676,8 @@ def _stop_chat_process(chat_id):
     message once it notices the stdout stream ended)."""
     with chat_procs_lock:
         record = chat_procs.pop(chat_id, None)
+        if record:
+            busy_chats.discard(chat_id)
     if not record:
         return
     proc = record["proc"]
@@ -1711,10 +1725,14 @@ def send_turn_to_chat_process(
     which can produce real permission_denials in the result event.
     """
     record = _ensure_chat_process(chat_id, model, permission_mode, workspace, config_dir, state)
-    record["pending_prompt"] = prompt
-    record["last_activity"] = time.time()
     msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}
     with record["write_lock"]:
+        # Mid-turn user messages are injected into the live turn too, but
+        # denial/retry and interrupted-turn UX must stay tied to the prompt
+        # that STARTED that turn, not whichever injection happened last.
+        if record["original_prompt"] is None:
+            record["original_prompt"] = prompt
+        record["last_activity"] = time.time()
         record["proc"].stdin.write(json.dumps(msg) + "\n")
         record["proc"].stdin.flush()
 
@@ -1798,7 +1816,6 @@ def handle_command(chat_id, text, state, offset=None):
         return True
 
     if cmd == "new":
-        clear_session(state, chat_id)
         # Session id isn't part of a chat process's restart signature (see
         # _ensure_chat_process) -- has to be torn down explicitly here, or
         # the next message would land on the OLD live process/session
@@ -1806,6 +1823,7 @@ def handle_command(chat_id, text, state, offset=None):
         # active right now, this doubles as an implicit /stop -- treated
         # as reasonable given the user explicitly asked to start fresh.
         _stop_chat_process(chat_id)
+        clear_session(state, chat_id)
         send_message(chat_id, "Начинаю новую сессию.")
         return True
 
@@ -1855,8 +1873,8 @@ def handle_command(chat_id, text, state, offset=None):
             send_message(chat_id, f"Сессия {arg} не найдена.")
             return True
         sid = os.path.basename(matches[0])[:-6]
-        set_session(state, chat_id, sid)
         _stop_chat_process(chat_id)  # see /new -- same reason
+        set_session(state, chat_id, sid)
         send_message(chat_id, f"Продолжаю сессию {sid[:8]}.")
         return True
 
