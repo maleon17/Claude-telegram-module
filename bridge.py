@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Claude Code <-> Telegram bridge.
 
-Drives `claude -p --output-format=stream-json` per inbound Telegram message,
-streaming tool calls and intermediate text back as live message edits, with
-per-chat session management (.new / .sessions / .resume).
+Runs one persistent `claude -p --input-format=stream-json --output-format=
+stream-json` process per chat (see `chat_procs`), not spawn-per-message --
+kept alive across turns via _ensure_chat_process/_chat_reader_loop, torn
+down and respawned only on /new, /resume, a /model|/mode|/workspace
+change, /stop, a crash, or a long idle timeout. Streams tool calls and
+intermediate text back as live message edits, with per-chat session
+management (.new / .sessions / .resume).
 
 Formatting (format_message) is ported from hermes-agent, MIT License,
 Copyright (c) 2025 Nous Research — see telegram_format.py.
@@ -13,6 +17,7 @@ import json
 import mimetypes
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -43,7 +48,15 @@ PROJECTS_DIR = os.path.join(
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API_BASE = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 EDIT_THROTTLE_S = 1.3
+# Same Braille frame set as jarvis-ask's THINKING_SPINNER_FRAMES (claude_ask.py)
+# -- a purely cosmetic "still alive" cue for the live-progress message (see
+# _flush_draft), advanced at most once per EDIT_THROTTLE_S/spinner-ticker tick,
+# nowhere near the ~0.5s dedicated-timer cadence that got jarvis-ask's account
+# banned from a group once -- this only ever rides on the same throttled edit
+# calls that already existed, never a faster loop of its own.
+THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
 MAX_MSG_LEN = 4000
+COST_WARNING_USD = 100.0  # one-time per-session heads-up, see add_usage()
 RICH_MAX_CHARS = 32000  # Bot API 10.1 cap is 32768; leave headroom.
 
 # Per-instance uploads dir, derived from STATE_FILE so the two bridge
@@ -63,8 +76,25 @@ FILE_PATH_RE = re.compile(
     r")\b)"
 )
 
-# chat_id -> subprocess.Popen of the currently running `claude` turn.
-active_procs = {}
+# chat_id -> {"proc", "signature", "reader_thread", "last_activity",
+# "pending_prompt"} for that chat's PERSISTENT `claude --input-format=
+# stream-json` process (2026-08-18 migration off spawn-per-message -- see
+# _ensure_chat_process/_chat_reader_loop). Only 2 real users on this
+# instance (owner + father), so holding one live process per chat
+# indefinitely is cheap and buys back the per-message CLI cold-start
+# (~6s measured) and MCP reconnect churn spawn-per-message paid every
+# single turn, plus fixes background-task notifications structurally
+# (confirmed live: a backgrounded Bash/Agent task's completion arrives as
+# a spontaneous new stream event on the SAME open stdout, no new stdin
+# message needed -- the old WAKEUP_SIGNAL_DIR file-signal convention
+# below was a workaround for exactly this gap and is no longer load-
+# bearing, kept only as a harmless legacy fallback).
+chat_procs = {}
+chat_procs_lock = threading.Lock()
+# Reap a chat's persistent process after this long with no activity --
+# not for cost (RAM is not the constraint here), just hygiene against an
+# unbounded number of long-idle MCP connections/fds piling up forever.
+CHAT_PROC_IDLE_TIMEOUT_S = 6 * 3600
 # chat_ids with a turn currently in flight (guards against overlapping
 # --resume calls onto the same session).
 busy_chats = set()
@@ -95,19 +125,16 @@ ACCOUNTS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)), "accounts"
 )
 
-# Background-task wakeup: a `claude -p --resume` turn's process exits once
-# its reply is sent. If Claude backgrounds a long shell command mid-turn
-# (`long_cmd; ... &`) and it finishes AFTER that, there's nothing left
-# alive to notice -- Claude Code's own background-task notification only
-# reaches the process that's still running, not a resumed session nobody
-# re-invoked. So the actual completion has to come from the backgrounded
-# shell command itself, not from anything Claude Code's harness delivers
-# after the fact. Convention (see BRIDGE_PROJECT_HANDOFF.md): a backgrounded
-# command appends a JSON file here on completion using the $CHAT_ID and
-# $WAKEUP_SIGNAL_DIR env vars run_claude() injects into every turn; this
-# per-instance dir (mirrors UPLOADS_DIR) is polled by _wakeup_watcher_loop,
-# which spawns a normal turn to let Claude react and reply -- same
-# formatting/session pipeline as any real incoming message, nothing special.
+# Background-task wakeup (LEGACY, kept as a harmless fallback -- see 2026-
+# 08-18 migration note on `chat_procs` above): originally built because a
+# `claude -p --resume` turn's process exited the instant its reply was
+# sent, so a backgrounded shell command finishing AFTER that had nothing
+# left alive to notice. Under the persistent-process model this no longer
+# happens -- confirmed live that a backgrounded task's completion arrives
+# as a spontaneous new event on the chat's still-open stdout, no signal
+# file needed. Left in place (env vars still injected into every turn,
+# watcher thread still runs) in case anything still relies on the
+# convention, but nothing should need to reach for it going forward.
 WAKEUP_SIGNAL_DIR = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)),
     "wakeup_signals_" + os.path.splitext(os.path.basename(STATE_FILE))[0],
@@ -165,6 +192,10 @@ def claude_env(config_dir, chat_id=None):
 # ---------------------------------------------------------------------------
 
 
+def _tg_rate_limited(response):
+    return response.get("error_code") == 429
+
+
 def tg_call(method, params=None, timeout=20):
     url = f"{API_BASE}/{method}"
     data = json.dumps(params or {}).encode()
@@ -173,14 +204,26 @@ def tg_call(method, params=None, timeout=20):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            result = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         try:
-            return json.loads(e.read().decode())
+            result = json.loads(e.read().decode())
         except Exception:
-            return {"ok": False, "error": str(e)}
+            result = {"ok": False, "error": str(e)}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        result = {"ok": False, "error": str(e)}
+
+    if not result.get("ok"):
+        if _tg_rate_limited(result):
+            retry_after = (result.get("parameters") or {}).get("retry_after")
+            print(
+                f"Telegram {method} not ok: 429 Too Many Requests; "
+                f"bot rate-limited for {retry_after} seconds: {result}",
+                flush=True,
+            )
+        else:
+            print(f"Telegram {method} not ok: {result}", flush=True)
+    return result
 
 
 def send_message(chat_id, text, reply_to=None):
@@ -191,7 +234,7 @@ def send_message(chat_id, text, reply_to=None):
     if reply_to:
         params["reply_to_message_id"] = reply_to
     r = tg_call("sendMessage", params)
-    if not r.get("ok"):
+    if not r.get("ok") and not _tg_rate_limited(r):
         # Fall back to plain text if MarkdownV2 parsing rejected something.
         params["text"] = strip_mdv2(text)
         params.pop("parse_mode", None)
@@ -216,10 +259,12 @@ def send_message_chunked(chat_id, text, reply_to=None):
         formatted = format_message(part)
         params = {"chat_id": chat_id, "text": formatted, "parse_mode": "MarkdownV2"}
         r = tg_call("sendMessage", params)
-        if not r.get("ok"):
+        if not r.get("ok") and not _tg_rate_limited(r):
             params["text"] = strip_mdv2(part)
             params.pop("parse_mode", None)
             r = tg_call("sendMessage", params)
+        if _tg_rate_limited(r):
+            return r
         last = r
     return last
 
@@ -236,6 +281,8 @@ def edit_message(chat_id, message_id, text):
     }
     r = tg_call("editMessageText", params)
     if not r.get("ok"):
+        if _tg_rate_limited(r):
+            return r
         desc = str(r.get("description", ""))
         if "not modified" in desc.lower():
             return r
@@ -378,6 +425,8 @@ def send_rich(chat_id, markdown_text, reply_to=None):
         params["reply_parameters"] = {"message_id": reply_to}
     r = tg_call("sendRichMessage", params)
     if not r.get("ok"):
+        if _tg_rate_limited(r):
+            return r
         return send_message(chat_id, markdown_text, reply_to)
     return r
 
@@ -391,6 +440,8 @@ def edit_rich(chat_id, message_id, markdown_text):
     }
     r = tg_call("editMessageText", params)
     if not r.get("ok"):
+        if _tg_rate_limited(r):
+            return r
         desc = str(r.get("description", ""))
         if "not modified" in desc.lower():
             return r
@@ -593,6 +644,7 @@ def _empty_usage():
     return {
         "calls": 0,
         "cost_usd": 0.0,
+        "cost_baseline_usd": 0.0,  # see reset_cost_warning_baseline()
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_read_tokens": 0,
@@ -605,14 +657,30 @@ def _empty_usage():
 def add_usage(state, chat_id, session_id, result_event):
     if not session_id:
         return
+    prev_cost = new_cost = baseline = None
     with state_lock:
         entry = state.setdefault(str(chat_id), {})
         sessions = entry.setdefault("sessions", {})
         usage = sessions.setdefault(session_id, _empty_usage())
         usage.setdefault("by_model", {})
+        usage.setdefault("cost_baseline_usd", 0.0)
 
         usage["calls"] += 1
-        usage["cost_usd"] += result_event.get("total_cost_usd") or 0.0
+        # total_cost_usd on a "result" event is the CUMULATIVE cost of the
+        # whole resumed session/process, not a per-turn delta -- confirmed
+        # empirically 2026-08-22 by watching it across several turns on one
+        # persistent stream-json process (it only ever grows by the new
+        # turn's own cost, never resets). Summing it turn over turn -- the
+        # old behavior, correct back when bridge.py spawned a genuinely
+        # fresh `claude -p` per message -- massively overcounts once a
+        # session runs many turns under the 2026-08-19 persistent-process
+        # model (roughly an N-term arithmetic-series overcount for an
+        # N-turn session). Assign, don't accumulate.
+        prev_cost = usage["cost_usd"]
+        baseline = usage["cost_baseline_usd"]
+        new_cost = result_event.get("total_cost_usd")
+        if new_cost is not None:
+            usage["cost_usd"] = new_cost
         u = result_event.get("usage") or {}
         usage["input_tokens"] += u.get("input_tokens") or 0
         usage["output_tokens"] += u.get("output_tokens") or 0
@@ -624,14 +692,52 @@ def add_usage(state, chat_id, session_id, result_event):
             + (u.get("cache_creation_input_tokens") or 0)
         )
 
-        for model_name, mu in (result_event.get("modelUsage") or {}).items():
-            bm = usage["by_model"].setdefault(
-                model_name, {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0}
-            )
-            bm["cost_usd"] += mu.get("costUSD") or 0.0
-            bm["input_tokens"] += mu.get("inputTokens") or 0
-            bm["output_tokens"] += mu.get("outputTokens") or 0
+        # Like total_cost_usd above, modelUsage[*].costUSD/inputTokens/
+        # outputTokens are cumulative-for-the-session snapshots, not
+        # per-turn deltas -- summing them via += across turns caused the
+        # same N-term overcount (e.g. ~$200 shown for a model on a session
+        # that actually cost ~$19 total). Assign the latest snapshot
+        # instead of accumulating.
+        model_usage = result_event.get("modelUsage")
+        if model_usage:
+            usage["by_model"] = {
+                model_name: {
+                    "cost_usd": mu.get("costUSD") or 0.0,
+                    "input_tokens": mu.get("inputTokens") or 0,
+                    "output_tokens": mu.get("outputTokens") or 0,
+                }
+                for model_name, mu in model_usage.items()
+            }
 
+        save_state(state)
+
+    # cost_usd is cumulative for the session (see above), so comparing it
+    # against a fixed baseline (0.0 until the first /compact, then reset
+    # to whatever cost_usd was at that point -- see
+    # reset_cost_warning_baseline()) fires exactly once per $100 accrued
+    # since the last compaction, without a separate "already warned" flag.
+    if new_cost is not None and prev_cost - baseline < COST_WARNING_USD <= new_cost - baseline:
+        send_message(
+            chat_id,
+            f"⚠️ Стоимость этой сессии по API-эквиваленту выросла ещё на "
+            f"${COST_WARNING_USD:.0f} (всего ~${new_cost:.2f}). "
+            f"Есть смысл сделать /compact или начать заново через /new.",
+        )
+
+
+def reset_cost_warning_baseline(state, chat_id, session_id):
+    """Called after a successful /compact so the $100 warning in
+    add_usage() can fire again for cost accrued from this point forward --
+    without this, cost_usd (cumulative for the whole session) stays above
+    the threshold forever after the first warning, so a session that keeps
+    compacting and growing again would never get warned a second time."""
+    if not session_id:
+        return
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        sessions = entry.setdefault("sessions", {})
+        usage = sessions.setdefault(session_id, _empty_usage())
+        usage["cost_baseline_usd"] = usage.get("cost_usd", 0.0)
         save_state(state)
 
 
@@ -787,6 +893,14 @@ def _restart_watcher_loop(state):
         # See the offset-flush comment in main() for why this is needed --
         # same reasoning applies here.
         tg_call("getUpdates", {"offset": current_offset[0], "timeout": 0})
+        # Belt-and-suspenders on top of the SIGTERM handler
+        # (_shutdown_chat_processes) -- clean these up here too before
+        # asking systemd to restart us, rather than relying on the signal
+        # alone.
+        with chat_procs_lock:
+            chat_ids = list(chat_procs.keys())
+        for cid in chat_ids:
+            _stop_chat_process(cid)
         subprocess.Popen(["sudo", "-n", "systemctl", "restart", SERVICE_NAME])
 
 
@@ -875,7 +989,11 @@ def _wakeup_watcher_loop(state):
 def fetch_account_limits(config_dir=None):
     """Shell out to Claude Code's own /usage slash command for real account-level
     5-hour/weekly rate limit info. Runs as a standalone call (no --resume) so it
-    doesn't pollute any conversation's session transcript.
+    doesn't pollute any conversation's session transcript -- and with
+    --no-session-persistence so it doesn't create a throwaway session file of
+    its own either (found live 2026-08-18: every /usage call was leaving a
+    permanent 6-line junk session behind, 58 of them had piled up in
+    ~/.claude/projects/-home-mishin/ alone before this was caught).
 
     Returns just the two headline lines (session / week), not the verbose
     "what's contributing" breakdown.
@@ -889,6 +1007,7 @@ def fetch_account_limits(config_dir=None):
                 "--output-format=stream-json",
                 "--verbose",
                 "--dangerously-skip-permissions",
+                "--no-session-persistence",
             ],
             cwd=WORKDIR,
             env=claude_env(config_dir),
@@ -985,7 +1104,7 @@ def tool_call_line(name, tool_input):
         return f"🔍 WebSearch: `{tool_input.get('query', '')[:150]}`"
     if name in ("WebFetch",):
         return f"🌐 WebFetch: `{tool_input.get('url', '')}`"
-    keys_preview = json.dumps(tool_input)[:300]
+    keys_preview = json.dumps(tool_input, ensure_ascii=False)[:300]
     return f"🔧 {name}:\n```\n{keys_preview}\n```"
 
 
@@ -1004,132 +1123,271 @@ def draft_tool_label_and_content(name, tool_input):
         return "🔍 WebSearch", tool_input.get("query", "")
     if name == "WebFetch":
         return "🌐 WebFetch", tool_input.get("url", "")
-    return f"🔧 {name}", json.dumps(tool_input)
+    return f"🔧 {name}", json.dumps(tool_input, ensure_ascii=False)
 
 
-def run_claude(
-    chat_id,
-    prompt,
-    session_id,
-    state,
-    model=None,
-    permission_mode=None,
-    workspace=None,
-    config_dir=None,
-):
-    """Drive one turn. Live progress is shown via a `sendMessageDraft`
-    (Bot API 9.3) animated one-line preview, keyed on chat_id as draft_id --
-    ephemeral, expires after 30s if not refreshed, and can't itself persist
-    a message. Once the turn finishes, the full tool-call/reasoning log (if
-    any) and the final answer are each sent ONCE as real, persisted
-    messages -- no more repeated edits of long-lived messages.
+def _draft_clean(s, limit=200):
+    s = strip_mdv2(s)
+    s = s.replace("```", "").replace("`", "").replace("\\", "")
+    return re.sub(r"\s+", " ", s).strip()[:limit]
 
-    permission_mode: None (or "bypass") -> --dangerously-skip-permissions
-    (current default, unchanged). Any other value -> --permission-mode <mode>,
-    which can produce real permission_denials in the result event.
-    """
-    args = [
-        CLAUDE_BIN,
-        "-p",
-        prompt,
-        "--output-format=stream-json",
-        "--include-partial-messages",
-        "--verbose",
-    ]
-    if permission_mode and permission_mode != "bypass":
-        args.append(f"--permission-mode={permission_mode}")
-    else:
-        args.append("--dangerously-skip-permissions")
-    if session_id:
-        args.append(f"--resume={session_id}")
-    if model:
-        args.append(f"--model={model}")
 
-    proc = subprocess.Popen(
-        args,
-        cwd=workspace or WORKDIR,
-        env=claude_env(config_dir, chat_id),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    active_procs[chat_id] = proc
+def _new_turn_accumulator(state, chat_id):
+    """Fresh per-turn accumulator for _chat_reader_loop. One of these is
+    live at a time per chat process; reset right after each delivered
+    "result" event so state from one turn never bleeds into the next."""
+    return {
+        "log_lines": [],
+        "current_session_id": get_session(state, chat_id),
+        "last_draft_edit": 0.0,
+        "final_text": None,
+        "last_text_log_index": None,
+        "last_text_log_raw": None,
+        "denials": [],
+        "written_files": [],
+        "compact_outcome": None,
+        "compact_done_event": None,
+        # Draft rendering state, two levels:
+        # - draft_thought: the current "thinking"/text block, plain (no
+        #   code formatting). Stays as an anchor across however many tool
+        #   calls happen under it.
+        # - draft_cmd / draft_res: the current tool call + its result,
+        #   each their own code block, overwriting the previous pair the
+        #   same way as before -- but scoped UNDER the current thought.
+        "draft_thought": None,
+        "draft_cmd_label": None,
+        "draft_cmd": None,
+        "draft_res_blocks": [],  # list of (label, content)
+        # message_id of the live progress message this turn (see
+        # _flush_draft) -- None until the first flush sends it.
+        "progress_msg_id": None,
+        # Braille-spinner frame index (see THINKING_SPINNER_FRAMES) --
+        # advances on every actual send/edit, purely cosmetic "still alive"
+        # signal now that we no longer get Telegram's own native draft
+        # animation for free.
+        "spinner_i": 0,
+    }
 
-    log_lines = []
-    current_session_id = session_id
-    last_draft_edit = 0.0
-    final_text = None
-    last_text_log_index = None
-    last_text_log_raw = None
-    denials = []
-    written_files = []
 
-    # Draft rendering state, two levels:
-    # - draft_thought: the current "thinking"/text block, plain (no code
-    #   formatting). Stays as an anchor across however many tool calls
-    #   happen under it.
-    # - draft_cmd / draft_res: the current tool call + its result, each
-    #   their own code block, overwriting the previous pair the same way
-    #   as before -- but scoped UNDER the current thought.
-    # A new thought clears everything (old thought + whatever tool
-    # cmd/result was showing) and starts fresh; a new tool call only
-    # clears the previous cmd/result, leaving the thought in place.
-    draft_thought = None
-    draft_cmd_label = None
-    draft_cmd = None
-    draft_res_blocks = []  # list of (label, content) -- Bash can have both stdout and stderr
+def _flush_draft(chat_id, ts, force=False):
+    # Plain sendMessage + editMessageText for live progress -- swapped away
+    # from sendMessageDraft (Bot API 9.3/9.5, and its can_stop/
+    # stopped_message_generation follow-up) on 2026-08-28 after it proved
+    # unreliable in real use: it occupies the RECIPIENT's own compose box
+    # while streaming (confirmed live -- send button gone entirely, "три
+    # точки" indicator instead), with wildly inconsistent behavior across
+    # attempts/clients in the same session (blocked, then not blocked, then
+    # no visible progress at all -- can_stop's button never rendered on the
+    # owner's client despite the API accepting the parameter). A real,
+    # persisted message never touches the compose box and has none of that
+    # flakiness -- this is what live progress used to be before drafts, and
+    # what it's going back to. The message gets deleted once the turn's
+    # real process-log + answer are sent (see _deliver_turn_result) so it
+    # doesn't linger as stale clutter.
+    now = time.time()
+    if not force and (now - ts["last_draft_edit"]) < EDIT_THROTTLE_S:
+        return
+    lines = []
+    if ts["draft_thought"]:
+        lines.append(escape_mdv2(ts["draft_thought"]))
+    if ts["draft_cmd"]:
+        lines.append(escape_mdv2(f"{ts['draft_cmd_label']}:"))
+        lines.append(f"```\n{ts['draft_cmd']}\n```")
+        for label, content in ts["draft_res_blocks"]:
+            lines.append(escape_mdv2(f"{label}:"))
+            lines.append(f"```\n{content}\n```")
+    body = "\n".join(lines) if lines else "Думаю"
+    frame = THINKING_SPINNER_FRAMES[ts["spinner_i"] % len(THINKING_SPINNER_FRAMES)]
+    ts["spinner_i"] += 1
+    text = f"{frame} {body}"
 
-    def _draft_clean(s, limit=200):
-        s = strip_mdv2(s)
-        s = s.replace("```", "").replace("`", "").replace("\\", "")
-        return re.sub(r"\s+", " ", s).strip()[:limit]
-
-    def flush_draft(force=False):
-        # Telegram's own draft bubble already renders a native animated
-        # indicator on its own -- our own spinner char + a literal "..."
-        # on top of that was three competing animations in one line. Just
-        # send the status text and let Telegram do the "alive" part.
-        nonlocal last_draft_edit
-        now = time.time()
-        if not force and (now - last_draft_edit) < EDIT_THROTTLE_S:
-            return
-        lines = []
-        if draft_thought:
-            # Unlike draft_cmd/draft_res (inside a code span, where regular
-            # punctuation needs no escaping), this is raw top-level
-            # MarkdownV2 text -- real sentences are full of unescaped
-            # ".,()-!" etc., which made sendMessageDraft fail its parse
-            # silently (no error is ever checked) and just freeze on
-            # whatever the last successful frame was.
-            lines.append(escape_mdv2(draft_thought))
-        if draft_cmd:
-            # Triple backticks (a "pre" entity) instead of single -- single
-            # backtick is just inline "code" (tap-to-copy, no distinct
-            # visual box); pre blocks get their own background, matching
-            # what the final persisted process message already does.
-            lines.append(escape_mdv2(f"{draft_cmd_label}:"))
-            lines.append(f"```\n{draft_cmd}\n```")
-            for label, content in draft_res_blocks:
-                lines.append(escape_mdv2(f"{label}:"))
-                lines.append(f"```\n{content}\n```")
-        text = "\n".join(lines) if lines else "Думаю"
-        r = tg_call("sendMessageDraft", {
-            "chat_id": chat_id,
-            "draft_id": chat_id,
-            "parse_mode": "MarkdownV2",
-            "text": text,
-        })
+    if ts["progress_msg_id"] is None:
+        r = tg_call("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2"})
         if not r.get("ok"):
-            # A parse failure here used to just freeze the draft on its
-            # last successful frame with no indication anything was wrong.
-            # Fall back to plain text (no entities) so it keeps moving.
-            tg_call("sendMessageDraft", {
-                "chat_id": chat_id,
-                "draft_id": chat_id,
-                "text": strip_mdv2(text).replace("```", ""),
-            })
-        last_draft_edit = now
+            r = tg_call("sendMessage", {"chat_id": chat_id, "text": strip_mdv2(text).replace("```", "")})
+        if r.get("ok"):
+            ts["progress_msg_id"] = r["result"]["message_id"]
+    else:
+        params = {
+            "chat_id": chat_id, "message_id": ts["progress_msg_id"],
+            "text": text, "parse_mode": "MarkdownV2",
+        }
+        r = tg_call("editMessageText", params)
+        if not r.get("ok"):
+            desc = str(r.get("description", "")).lower()
+            if "not modified" not in desc:
+                params["text"] = strip_mdv2(text).replace("```", "")
+                params.pop("parse_mode", None)
+                tg_call("editMessageText", params)
+    ts["last_draft_edit"] = now
+
+
+def _compact_draft_watchdog(chat_id, ts):
+    """Refreshes the "🗜 Сжимаю контекст..." progress message every 15s
+    with an updated elapsed-time counter for as long as a real compaction
+    is running (a real persisted message -- see _flush_draft -- doesn't
+    expire on its own the way the old sendMessageDraft did, so this is now
+    a live counter rather than something keeping the message from vanishing).
+    Exits as soon as ts["compact_done_event"] is set (compact_result
+    arrived) or, as a belt-and-suspenders cap, after 20 minutes."""
+    start = time.time()
+    done = ts["compact_done_event"]
+    while not done.wait(timeout=15):
+        elapsed = int(time.time() - start)
+        ts["draft_thought"] = f"🗜 Сжимаю контекст сессии... ({elapsed}с, это может занять несколько минут)"
+        _flush_draft(chat_id, ts, force=True)
+        if elapsed > 1200:
+            return
+
+
+def _deliver_turn_result(chat_id, state, ts, prompt, stopped=False):
+    """Everything that used to happen after run_claude() returned, plus
+    dispatch_turn()'s own tail (attachments, denial handling) -- merged
+    here because in the persistent-process model EVERY turn, whether we
+    explicitly wrote it to stdin or it's a spontaneous reply to a
+    background task finishing on its own, is delivered from
+    _chat_reader_loop, not from whoever originally called dispatch_turn."""
+    log_lines = ts["log_lines"]
+    final_text = ts["final_text"]
+
+    # The last assistant text block is what becomes the final answer
+    # (echoed in the "result" event) -- drop it from the process log so
+    # it isn't duplicated between the collapsible process block and the
+    # answer.
+    if (
+        ts["last_text_log_index"] is not None
+        and final_text is not None
+        and ts["last_text_log_raw"] is not None
+        and ts["last_text_log_raw"].strip() == final_text.strip()
+        and 0 <= ts["last_text_log_index"] < len(log_lines)
+    ):
+        del log_lines[ts["last_text_log_index"]]
+
+    progress_became_process_block = False
+    if log_lines:
+        MAIN_BUDGET = 30000
+        LAST_TOOL_RESERVE = 2000
+        budget = MAIN_BUDGET + LAST_TOOL_RESERVE
+        visible = []
+        used = 0
+        for line in reversed(log_lines):
+            cost = len(line) + 1
+            if used + cost > budget and visible:
+                break
+            visible.append(line)
+            used += cost
+        visible.reverse()
+        hidden = len(log_lines) - len(visible)
+        body_lines = [f"…и ещё {hidden} шагов выше…"] if hidden > 0 else []
+        body_lines.extend(visible)
+        body = "\n".join(body_lines)
+        rich_text = f"<details><summary>🔧 Процесс ({len(log_lines)})</summary>\n{body}\n</details>"
+        if ts["progress_msg_id"] is not None:
+            # Turn the live-progress message itself INTO the collapsible
+            # process-log block, in place, instead of deleting it and
+            # sending a separate new message -- one fewer message in the
+            # chat, and the transition reads as "this IS what it was
+            # building the whole time" rather than a swap.
+            edit_rich(chat_id, ts["progress_msg_id"], rich_text)
+            progress_became_process_block = True
+        else:
+            send_rich(chat_id, rich_text)
+
+    if ts["current_session_id"]:
+        set_session(state, chat_id, ts["current_session_id"])
+
+    if stopped:
+        # This path fires whenever the persistent process ends with a turn
+        # still pending -- an explicit /stop, but also /new, /resume, a
+        # /model|/mode|/workspace change, a /restart, or a genuine crash of
+        # the underlying `claude` process (confirmed live 2026-08-24: a
+        # long-running /compact on a large session can end this way with
+        # no exception or stderr output anywhere). "по /stop" would lie in
+        # every case except the first, so keep the wording cause-agnostic.
+        text_out = "⏹ Ход прерван — процесс завершился, не дождавшись ответа."
+    elif ts.get("compact_outcome"):
+        text_out = ts["compact_outcome"]
+    else:
+        text_out = final_text if final_text is not None else "(нет ответа — смотри процесс выше)"
+
+    if ts["progress_msg_id"] is not None and not progress_became_process_block:
+        # Either there was no tool-call content at all (a plain
+        # conversational turn), or there was but it already got absorbed
+        # into the process block above -- either way, the live-progress
+        # message is still sitting there unused. Turn IT into the final
+        # answer, in place, instead of deleting it and sending a fresh
+        # message (caught live 2026-08-28: that delete+resend was visibly
+        # flickering -- the answer would flash as the progress message,
+        # vanish, then reappear as a "new" one a beat later).
+        edit_rich(chat_id, ts["progress_msg_id"], text_out or "(пусто)")
+    else:
+        send_rich(chat_id, text_out or "(пусто)")
+
+    if not stopped:
+        attachments = list(ts["written_files"])
+        for p in extract_existing_files(text_out or ""):
+            if p not in attachments:
+                attachments.append(p)
+        for path in attachments:
+            if os.path.isfile(path):
+                send_attachment(chat_id, path)
+
+    if ts["denials"] and prompt:
+        set_pending_prompt(state, chat_id, prompt)
+        lines = ["🚫 **Заблокировано** (нужно разрешение):"]
+        for d in ts["denials"][:10]:
+            lines.append(f"`{d.get('tool_name', '?')}`  {json.dumps(d.get('tool_input', {}), ensure_ascii=False)[:150]}")
+        lines.append("")
+        lines.append("/approve — повторить один раз с bypass")
+        lines.append("/approve session — включить bypass насовсем для этой сессии")
+        lines.append("/deny — оставить как есть")
+        send_message(chat_id, "\n".join(lines))
+    else:
+        clear_pending_prompt(state, chat_id)
+
+
+def _spinner_ticker_loop(chat_id, record, proc):
+    """Keeps the live-progress message's spinner frame (see
+    THINKING_SPINNER_FRAMES/_flush_draft) visibly ticking at a fixed ~1.5s
+    cadence for as long as this chat is busy. _flush_draft on its own only
+    fires on a real stream event (new thought/tool call/result) -- without
+    this, a long gap between events (waiting on a slow tool, a backgrounded
+    task, etc.) would leave the spinner frozen on one frame, looking dead
+    even though work is genuinely still happening. Tied to this specific
+    process's lifetime, same idea as _chat_proc_idle_reaper_loop -- exits
+    as soon as this process is no longer the live one for chat_id (respawned,
+    stopped, or the chat itself is idle) rather than running forever."""
+    while True:
+        time.sleep(1.5)
+        with chat_procs_lock:
+            if chat_procs.get(chat_id, {}).get("proc") is not proc:
+                return
+        if proc.poll() is not None:
+            return
+        if chat_id not in busy_chats:
+            continue
+        ts = record.get("ts")
+        if ts is not None and ts.get("progress_msg_id") is not None:
+            try:
+                _flush_draft(chat_id, ts, force=True)
+            except Exception:
+                pass
+
+
+def _chat_reader_loop(chat_id, state, record):
+    """Runs for the whole lifetime of one chat's persistent `claude`
+    process -- started once by _start_chat_process, not per-turn. Parses
+    every stdout line for as long as the process lives, across however
+    many turns arrive on its stdin over time. A "result" event marks a
+    turn's end regardless of whether it was explicitly requested (a
+    prompt we just wrote to stdin) or spontaneous (a backgrounded Bash/
+    Agent task finishing on its own -- confirmed live 2026-08-18 that
+    this arrives on the same open stdout with zero new stdin input
+    needed, which is what makes the old WAKEUP_SIGNAL_DIR workaround
+    obsolete for chats running under this model)."""
+    proc = record["proc"]
+    ts = _new_turn_accumulator(state, chat_id)
+    record["ts"] = ts  # see _spinner_ticker_loop -- needs the CURRENT ts
 
     try:
         for raw_line in proc.stdout:
@@ -1139,82 +1397,128 @@ def run_claude(
             try:
                 d = json.loads(raw_line)
             except Exception:
+                # Not silently discarded on purpose -- a non-JSON line on
+                # stdout is often the CLI's own plain-text error (e.g. "No
+                # conversation found with session ID: ...") right before it
+                # exits. Swallowing it here (as the old spawn-per-message
+                # code did too) makes a real crash indistinguishable from
+                # normal stream noise -- caught live 2026-08-19 debugging
+                # exactly that.
+                print(f"chat process ({chat_id}) non-JSON stdout: {raw_line[:500]!r}", flush=True)
                 continue
+            record["last_activity"] = time.time()
+            # Any real stdout activity means the process is doing SOMETHING
+            # right now, whether this is an explicit turn spawn_turn() already
+            # marked busy, or a spontaneous continuation (a backgrounded Bash/
+            # Agent task finishing on its own, per the "result" comment below)
+            # that spawn_turn() was never called for -- busy_chats had no
+            # code path re-adding a chat in that second case, so /stop (and
+            # /status) reported "nothing running" while a spontaneous turn
+            # was visibly still producing tool calls/text in Telegram (caught
+            # live 2026-08-28, three consecutive false "Сейчас ничего не
+            # выполняется" during exactly that window). Idempotent add here,
+            # single source of truth for "clear" stays the "result" event
+            # below -- this only widens WHEN busy gets set, not when it's
+            # cleared.
+            busy_chats.add(chat_id)
 
             t = d.get("type")
 
             if t == "system" and d.get("subtype") == "init":
-                current_session_id = d.get("session_id") or current_session_id
+                ts["current_session_id"] = d.get("session_id") or ts["current_session_id"]
+                continue
+
+            if t == "system" and d.get("subtype") == "status":
+                # /compact (sent like any other prompt, see handle_command)
+                # is a real CLI slash command, not text the model sees --
+                # confirmed live 2026-08-22. It reports through this status
+                # channel instead of an assistant text block, so the normal
+                # "result" event for that turn carries an empty final_text
+                # -- surface something useful instead of "(пусто)".
+                if d.get("status") == "compacting":
+                    ts["draft_thought"] = "🗜 Сжимаю контекст сессии..."
+                    ts["draft_cmd_label"] = None
+                    ts["draft_cmd"] = None
+                    ts["draft_res_blocks"] = []
+                    _flush_draft(chat_id, ts, force=True)
+                    # Real compaction on a large session takes MINUTES
+                    # (measured ~5 min on a ~400K-token session, 2026-08-24)
+                    # with zero intermediate stream events -- nothing else
+                    # would touch the progress message again before
+                    # compact_result finally arrives, so without a periodic
+                    # re-flush the elapsed-time counter in it would just sit
+                    # frozen for minutes, looking like a hang even though
+                    # the message itself (a real, persisted one -- see
+                    # _flush_draft) stays visible fine on its own.
+                    ts["compact_done_event"] = threading.Event()
+                    threading.Thread(
+                        target=_compact_draft_watchdog,
+                        args=(chat_id, ts),
+                        daemon=True,
+                    ).start()
+                elif "compact_result" in d:
+                    if ts["compact_done_event"]:
+                        ts["compact_done_event"].set()
+                    if d.get("compact_result") == "failed":
+                        err = d.get("compact_error") or "неизвестная ошибка"
+                        ts["compact_outcome"] = f"🗜 Не удалось сжать контекст: {err}"
+                    else:
+                        ts["compact_outcome"] = "🗜 Контекст сессии сжат."
+                        reset_cost_warning_baseline(state, chat_id, ts["current_session_id"])
                 continue
 
             if t == "stream_event":
                 ev = d.get("event", {})
                 if ev.get("type") == "content_block_delta":
-                    flush_draft()
+                    _flush_draft(chat_id, ts)
                 continue
 
             if t == "assistant":
                 content = d.get("message", {}).get("content", [])
+                # CLI stream-json content is normally a list of typed blocks,
+                # but can be a plain string (seen after /compact) -- nothing
+                # to extract from that case, so treat it as empty.
+                if isinstance(content, str):
+                    content = []
                 for block in content:
                     if block.get("type") == "tool_use":
                         name = block.get("name", "?")
                         tool_input = block.get("input", {})
-                        log_lines.append(tool_call_line(name, tool_input))
-                        # New tool call: clear the previous command+result
-                        # pair, but leave the current thought (if any) in
-                        # place -- tool calls happen "under" a thought.
-                        label, content = draft_tool_label_and_content(name, tool_input)
-                        draft_cmd_label = label
-                        draft_cmd = _draft_clean(content)
-                        draft_res_blocks = []
-                        flush_draft(force=True)
+                        ts["log_lines"].append(tool_call_line(name, tool_input))
+                        label, content_ = draft_tool_label_and_content(name, tool_input)
+                        ts["draft_cmd_label"] = label
+                        ts["draft_cmd"] = _draft_clean(content_)
+                        ts["draft_res_blocks"] = []
+                        _flush_draft(chat_id, ts, force=True)
                         if name == "Write":
                             fp = tool_input.get("file_path")
-                            # Exclude anything under ~/.claude/ (auto-memory,
-                            # session/project bookkeeping, settings) -- these
-                            # are Claude's own internal writes, never a
-                            # deliverable for the chat. Without this, e.g. a
-                            # memory-file save gets auto-attached to the next
-                            # reply as if it were a file the user asked for
-                            # (caught live 2026-08-13: a memory note about an
-                            # unrelated deploy mistake showed up as a random
-                            # attachment mid-conversation).
                             if fp and not os.path.abspath(os.path.expanduser(fp)).startswith(
                                 os.path.expanduser("~/.claude/") + os.sep
                             ):
-                                written_files.append(fp)
+                                ts["written_files"].append(fp)
                     elif block.get("type") in ("text", "thinking"):
-                        # "text" is visible reasoning/answer text; "thinking"
-                        # is an extended-thinking block (separate field name,
-                        # `thinking` not `text`) -- both are a new "thought"
-                        # for draft purposes, and both clear everything
-                        # (previous thought + whatever tool cmd/result was
-                        # showing under it), since a new thought starts a new
-                        # episode.
                         text = block.get("text") or block.get("thinking") or ""
                         if text.strip():
                             if block.get("type") == "text":
-                                log_lines.append(f"💬 {text}")
-                                last_text_log_index = len(log_lines) - 1
-                                last_text_log_raw = text
-                            draft_thought = _draft_clean(text, limit=300)
-                            draft_cmd_label = None
-                            draft_cmd = None
-                            draft_res_blocks = []
-                            flush_draft(force=True)
-                flush_draft()
+                                ts["log_lines"].append(f"💬 {text}")
+                                ts["last_text_log_index"] = len(ts["log_lines"]) - 1
+                                ts["last_text_log_raw"] = text
+                            ts["draft_thought"] = _draft_clean(text, limit=300)
+                            ts["draft_cmd_label"] = None
+                            ts["draft_cmd"] = None
+                            ts["draft_res_blocks"] = []
+                            _flush_draft(chat_id, ts, force=True)
+                _flush_draft(chat_id, ts)
                 continue
 
             if t == "user":
                 content = d.get("message", {}).get("content", [])
+                # see the "assistant" branch above for why this guard exists
+                if isinstance(content, str):
+                    content = []
                 for block in content:
                     if block.get("type") == "tool_result":
                         is_error = block.get("is_error", False)
-                        # Bash results carry separate stdout/stderr at the
-                        # top level (tool_use_result), even when the command
-                        # succeeded overall -- e.g. warnings on stderr with
-                        # exit 0. The merged `content` field used below loses
-                        # that distinction.
                         tur = d.get("tool_use_result")
                         stdout_text = tur.get("stdout") if isinstance(tur, dict) else None
                         stderr_text = tur.get("stderr") if isinstance(tur, dict) else None
@@ -1235,8 +1539,8 @@ def run_claude(
                             if not log_parts:
                                 icon = "❌" if is_error else "✅"
                                 log_parts.append(f"{icon} (пусто)")
-                            log_lines.append("\n".join(log_parts))
-                            draft_res_blocks = res_blocks
+                            ts["log_lines"].append("\n".join(log_parts))
+                            ts["draft_res_blocks"] = res_blocks
                         else:
                             result_content = block.get("content", "")
                             if isinstance(result_content, list):
@@ -1245,12 +1549,6 @@ def run_claude(
                                 )
                             result_content = str(result_content)
 
-                            # A command can print real output and still fail
-                            # (e.g. `echo ok; exit 1`) -- Claude Code merges
-                            # that into one "Exit code N\n<output>" string
-                            # with no stdout/stderr split at all. Pull the
-                            # output out and show it first, exit code after,
-                            # instead of dumping everything under "Ошибка".
                             exit_match = (
                                 re.match(r"^Exit code (\d+)\n?(.*)$", result_content, re.DOTALL)
                                 if is_error else None
@@ -1271,73 +1569,191 @@ def run_claude(
                                 preview = result_content.strip()[:400]
                                 log_parts.append(f"{label}:\n```\n{preview}\n```")
                                 res_blocks.append((label, _draft_clean(preview)))
-                            log_lines.append("\n".join(log_parts))
-                            # Result of the CURRENT command: append below
-                            # it, don't clear draft_cmd.
-                            draft_res_blocks = res_blocks
-                        flush_draft(force=True)
+                            ts["log_lines"].append("\n".join(log_parts))
+                            ts["draft_res_blocks"] = res_blocks
+                        _flush_draft(chat_id, ts, force=True)
                 continue
 
             if t == "result":
-                current_session_id = d.get("session_id") or current_session_id
-                final_text = d.get("result", "")
-                denials.extend(d.get("permission_denials") or [])
-                add_usage(state, chat_id, current_session_id, d)
+                ts["current_session_id"] = d.get("session_id") or ts["current_session_id"]
+                ts["final_text"] = d.get("result", "")
+                ts["denials"].extend(d.get("permission_denials") or [])
+                add_usage(state, chat_id, ts["current_session_id"], d)
+                prompt = record.pop("pending_prompt", None)
+                try:
+                    _deliver_turn_result(chat_id, state, ts, prompt, stopped=False)
+                except Exception:
+                    print(traceback.format_exc()[-1500:], flush=True)
+                busy_chats.discard(chat_id)
+                ts = _new_turn_accumulator(state, chat_id)
+                record["ts"] = ts
                 continue
-
-        proc.wait(timeout=10)
     except Exception:
-        log_lines.append(f"❌ bridge error:\n```\n{traceback.format_exc()[-1500:]}\n```")
+        print(f"chat_reader error ({chat_id}):\n" + traceback.format_exc()[-1500:], flush=True)
     finally:
+        with chat_procs_lock:
+            if chat_procs.get(chat_id, {}).get("proc") is proc:
+                chat_procs.pop(chat_id, None)
+        pending_prompt = record.pop("pending_prompt", None)
+        if pending_prompt is not None:
+            # Process ended (killed via /stop, torn down for a settings
+            # change, or crashed) while a turn was genuinely in flight --
+            # delivers the same "⏹ Остановлено" UX the old spawn-per-
+            # message model gave on /stop. If there was no pending turn
+            # (e.g. the idle reaper stopped a genuinely idle process),
+            # there's nothing to report.
+            try:
+                _deliver_turn_result(chat_id, state, ts, pending_prompt, stopped=True)
+            except Exception:
+                print(traceback.format_exc()[-1500:], flush=True)
+        busy_chats.discard(chat_id)
         if proc.poll() is None:
             proc.kill()
-        active_procs.pop(chat_id, None)
 
-    stopped = final_text is None and (proc.returncode or 0) < 0
 
-    # The last assistant text block is what becomes the final answer (echoed
-    # in the "result" event) — drop it from the process log so it isn't
-    # duplicated between the collapsible process block and the answer.
-    if (
-        last_text_log_index is not None
-        and final_text is not None
-        and last_text_log_raw is not None
-        and last_text_log_raw.strip() == final_text.strip()
-        and 0 <= last_text_log_index < len(log_lines)
-    ):
-        del log_lines[last_text_log_index]
+def _chat_process_signature(model, permission_mode, workspace, config_dir):
+    return (model, permission_mode, workspace, config_dir)
 
-    # Final, ONE-TIME persisted process-log message (only if there's
-    # anything to show -- a plain text-only turn with no tool calls has
-    # nothing left in log_lines after the dedup above, so it's skipped
-    # entirely instead of sending an empty bubble like before).
-    if log_lines:
-        MAIN_BUDGET = 30000
-        LAST_TOOL_RESERVE = 2000
-        budget = MAIN_BUDGET + LAST_TOOL_RESERVE
-        visible = []
-        used = 0
-        for line in reversed(log_lines):
-            cost = len(line) + 1
-            if used + cost > budget and visible:
-                break
-            visible.append(line)
-            used += cost
-        visible.reverse()
-        hidden = len(log_lines) - len(visible)
-        body_lines = [f"…и ещё {hidden} шагов выше…"] if hidden > 0 else []
-        body_lines.extend(visible)
-        body = "\n".join(body_lines)
-        send_rich(chat_id, f"<details><summary>🔧 Процесс ({len(log_lines)})</summary>\n{body}\n</details>")
 
-    if current_session_id:
-        set_session(state, chat_id, current_session_id)
-
-    if stopped:
-        text_out = "⏹ Остановлено по /stop."
+def _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, session_id, state):
+    args = [
+        CLAUDE_BIN,
+        "-p",
+        "--input-format=stream-json",
+        "--output-format=stream-json",
+        "--include-partial-messages",
+        "--verbose",
+    ]
+    if permission_mode and permission_mode != "bypass":
+        args.append(f"--permission-mode={permission_mode}")
     else:
-        text_out = final_text if final_text is not None else "(нет ответа — смотри процесс выше)"
-    return text_out, denials, written_files, stopped
+        args.append("--dangerously-skip-permissions")
+    if session_id:
+        args.append(f"--resume={session_id}")
+    if model:
+        args.append(f"--model={model}")
+
+    proc = subprocess.Popen(
+        args,
+        cwd=workspace or WORKDIR,
+        env=claude_env(config_dir, chat_id),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    record = {
+        "proc": proc,
+        "signature": _chat_process_signature(model, permission_mode, workspace, config_dir),
+        "last_activity": time.time(),
+        "pending_prompt": None,
+        "write_lock": threading.Lock(),
+    }
+    with chat_procs_lock:
+        chat_procs[chat_id] = record
+    threading.Thread(target=_chat_reader_loop, args=(chat_id, state, record), daemon=True).start()
+    threading.Thread(target=_spinner_ticker_loop, args=(chat_id, record, proc), daemon=True).start()
+    return record
+
+
+def _stop_chat_process(chat_id):
+    """Tears down chat_id's persistent process, if any. Safe to call any
+    time, including when there's no live process (no-op) or mid-turn
+    (the reader thread's own finally-block delivers the "⏹ Остановлено"
+    message once it notices the stdout stream ended)."""
+    with chat_procs_lock:
+        record = chat_procs.pop(chat_id, None)
+    if not record:
+        return
+    proc = record["proc"]
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        pass
+
+
+def _ensure_chat_process(chat_id, model, permission_mode, workspace, config_dir, state):
+    """Returns a live process record for chat_id, starting or restarting
+    one if needed. A restart is needed if there's no process yet, the
+    previous one died, or /model, /mode, or /workspace changed since it
+    was started (those are CLI flags, fixed for a process's lifetime --
+    changing them means killing and respawning with --resume onto the
+    same session so only the flags change, not the conversation)."""
+    wanted_sig = _chat_process_signature(model, permission_mode, workspace, config_dir)
+    with chat_procs_lock:
+        record = chat_procs.get(chat_id)
+    if record and record["proc"].poll() is None and record["signature"] == wanted_sig:
+        return record
+    if record:
+        _stop_chat_process(chat_id)
+    session_id = get_session(state, chat_id)
+    return _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, session_id, state)
+
+
+def send_turn_to_chat_process(
+    chat_id, prompt, state, model=None, permission_mode=None, workspace=None, config_dir=None,
+):
+    """Non-blocking: ensures chat_id's persistent process is up (spawning
+    or respawning it if needed) and writes `prompt` onto its stdin as one
+    stream-json user-message event. Delivery of the eventual reply --
+    progress draft, final answer, attachments, denial handling -- all
+    happens asynchronously in that chat's _chat_reader_loop thread, not
+    here; this returns as soon as the write itself succeeds.
+
+    permission_mode: None (or "bypass") -> --dangerously-skip-permissions
+    (current default, unchanged). Any other value -> --permission-mode <mode>,
+    which can produce real permission_denials in the result event.
+    """
+    record = _ensure_chat_process(chat_id, model, permission_mode, workspace, config_dir, state)
+    record["pending_prompt"] = prompt
+    record["last_activity"] = time.time()
+    msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}
+    with record["write_lock"]:
+        record["proc"].stdin.write(json.dumps(msg) + "\n")
+        record["proc"].stdin.flush()
+
+
+def _chat_proc_idle_reaper_loop():
+    """Reaps a chat's persistent process after CHAT_PROC_IDLE_TIMEOUT_S of
+    inactivity -- hygiene against unbounded long-idle MCP connections/fds,
+    not a cost-saving measure (RAM is not the constraint on this host, see
+    chat_procs comment). Only ever touches a chat that's currently NOT
+    mid-turn, so it can't race a real turn -- if a message arrives right
+    after a chat gets reaped, that chat's next _ensure_chat_process call
+    just respawns it, same as after any other restart."""
+    while True:
+        time.sleep(300)
+        now = time.time()
+        with chat_procs_lock:
+            stale = [
+                cid for cid, rec in chat_procs.items()
+                if cid not in busy_chats
+                and now - rec.get("last_activity", now) > CHAT_PROC_IDLE_TIMEOUT_S
+            ]
+        for cid in stale:
+            _stop_chat_process(cid)
+
+
+def _shutdown_chat_processes(*_args):
+    """SIGTERM handler (systemd sends this on `systemctl restart`). Plain
+    subprocess children do NOT get signalled automatically when their
+    parent dies -- without this they'd become orphaned but keep running,
+    leaking `claude` processes across every restart and potentially
+    fighting a freshly started bridge.py over the same --resume session
+    id. Best-effort and bounded (_stop_chat_process itself caps at a 5s
+    wait per process before kill -9) so a restart can't hang forever on
+    a stuck child."""
+    with chat_procs_lock:
+        chat_ids = list(chat_procs.keys())
+    for cid in chat_ids:
+        _stop_chat_process(cid)
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -1361,6 +1777,7 @@ COMMANDS = [
     ("resume", "Продолжить сессию по id"),
     ("status", "Текущее состояние: сессия/модель/режим/workspace"),
     ("stop", "Прервать текущий запрос"),
+    ("compact", "Сжать контекст текущей сессии (экономит токены/деньги)"),
     ("usage", "Токены, стоимость и лимиты аккаунта"),
     ("model", "Модель: /model opus 4.7, /model sonnet, /model default"),
     ("mode", "Режим подтверждений: bypass/default/acceptEdits/plan"),
@@ -1382,7 +1799,21 @@ def handle_command(chat_id, text, state, offset=None):
 
     if cmd == "new":
         clear_session(state, chat_id)
+        # Session id isn't part of a chat process's restart signature (see
+        # _ensure_chat_process) -- has to be torn down explicitly here, or
+        # the next message would land on the OLD live process/session
+        # instead of picking up the cleared one. If a turn happens to be
+        # active right now, this doubles as an implicit /stop -- treated
+        # as reasonable given the user explicitly asked to start fresh.
+        _stop_chat_process(chat_id)
         send_message(chat_id, "Начинаю новую сессию.")
+        return True
+
+    if cmd == "compact":
+        # Real CLI slash command, sent as an ordinary prompt onto the
+        # chat's persistent process -- see _chat_reader_loop's
+        # "system"/"status" handling for how the result gets reported.
+        spawn_turn(chat_id, "/compact", state)
         return True
 
     pdir = projects_dir_for(account_dir(chat_id), get_workspace(state, chat_id))
@@ -1404,12 +1835,28 @@ def handle_command(chat_id, text, state, offset=None):
         if not arg:
             send_message(chat_id, "Использование: /resume <session_id или префикс>")
             return True
-        matches = glob.glob(os.path.join(pdir, f"{arg}*.jsonl"))
+        # arg is untrusted (whitelisted-chat-controlled), and os.path.join
+        # silently discards pdir entirely if arg is absolute -- glob would
+        # then search anywhere the process can read. Resolve both to real
+        # paths and require the match to actually be a descendant of pdir
+        # before globbing, closing both the absolute-path and the ../
+        # traversal variant.
+        real_pdir = os.path.realpath(pdir)
+        candidate = os.path.realpath(os.path.join(real_pdir, arg))
+        if os.path.commonpath([real_pdir, candidate]) != real_pdir:
+            send_message(chat_id, f"Сессия {arg} не найдена.")
+            return True
+        matches = glob.glob(f"{candidate}*.jsonl")
+        matches = [
+            m for m in matches
+            if os.path.commonpath([real_pdir, os.path.realpath(m)]) == real_pdir
+        ]
         if not matches:
             send_message(chat_id, f"Сессия {arg} не найдена.")
             return True
         sid = os.path.basename(matches[0])[:-6]
         set_session(state, chat_id, sid)
+        _stop_chat_process(chat_id)  # see /new -- same reason
         send_message(chat_id, f"Продолжаю сессию {sid[:8]}.")
         return True
 
@@ -1602,13 +2049,19 @@ def register_commands():
 
 
 def _run_turn_thread(chat_id, prompt, state, force_permission_mode=None):
+    """dispatch_turn() now only ensures the chat's persistent process and
+    writes the prompt to its stdin -- it returns almost immediately, long
+    before the turn is actually done. So busy_chats is only cleared HERE
+    on a failure that happens before/during that write (nothing will ever
+    reach the reader thread to clear it in that case); on success,
+    clearing it is _chat_reader_loop's job once it sees this turn's
+    "result" event (or the process dying mid-turn)."""
     try:
         dispatch_turn(chat_id, prompt, state, force_permission_mode=force_permission_mode)
     except Exception:
         err = traceback.format_exc()[-1500:]
         print(err, flush=True)
         send_message(chat_id, f"Ошибка моста:\n```\n{err}\n```")
-    finally:
         busy_chats.discard(chat_id)
 
 
@@ -1633,18 +2086,27 @@ def spawn_turn(chat_id, prompt, state, force_permission_mode=None):
 # that arrives within a short debounce window per chat and dispatch it as a
 # single combined turn.
 BATCH_DEBOUNCE_S = 1.5
-BUSY_NOTICE_THROTTLE_S = 5.0
 pending_batches = {}
 batch_timers = {}
-last_busy_notice = {}
 
 
 def queue_prompt(chat_id, prompt, state):
     if chat_id in busy_chats:
-        now = time.time()
-        if now - last_busy_notice.get(chat_id, 0) > BUSY_NOTICE_THROTTLE_S:
-            send_message(chat_id, "Уже выполняю предыдущий запрос. Дождись ответа или используй /stop.")
-            last_busy_notice[chat_id] = now
+        # A live process for this chat is already mid-turn -- Claude Code's
+        # own stream-json protocol natively accepts another user-message
+        # event on the SAME open stdin and merges it into the ongoing turn
+        # (see send_turn_to_chat_process's docstring -- it only ever WRITES,
+        # it never asserts the process has to be idle first). This is
+        # exactly how the owner's own mid-turn messages reached Claude all
+        # through the 2026-08-28 session, surfaced to the model as a
+        # mid-turn injection rather than a fresh turn -- no /stop needed, no
+        # reason to bounce. Skips the batch debounce below on purpose: that
+        # debounce exists to avoid spawning N separate FRESH turns for rapid
+        # typing while idle, which doesn't apply here -- there's already
+        # exactly one open turn to append to, so each message goes straight
+        # through as its own distinct injection instead of getting merged
+        # into one blob.
+        dispatch_turn(chat_id, prompt, state)
         return
 
     pending_batches.setdefault(chat_id, []).append(prompt)
@@ -1667,49 +2129,18 @@ def queue_prompt(chat_id, prompt, state):
 
 
 def dispatch_turn(chat_id, prompt, state, force_permission_mode=None):
-    """Run one turn against Claude and report denials, if any, offering
-    /approve (once) / /approve session / /deny instead of blindly retrying."""
+    """Write one prompt onto chat_id's persistent process. Non-blocking --
+    see send_turn_to_chat_process's docstring. Delivery (final answer,
+    attachments, denial handling via /approve|/approve session|/deny) all
+    happens later, asynchronously, in _chat_reader_loop / _deliver_turn_result."""
     send_typing(chat_id)
 
-    session_id = get_session(state, chat_id)
     model = get_model(state, chat_id)
     permission_mode = force_permission_mode or get_permission_mode(state, chat_id)
     workspace = get_workspace(state, chat_id)
     config_dir = account_dir(chat_id)
 
-    final_text, denials, written_files, stopped = run_claude(
-        chat_id,
-        prompt,
-        session_id,
-        state,
-        model,
-        permission_mode,
-        workspace,
-        config_dir,
-    )
-    send_rich(chat_id, final_text or "(пусто)")
-
-    if not stopped:
-        attachments = list(written_files)
-        for p in extract_existing_files(final_text or ""):
-            if p not in attachments:
-                attachments.append(p)
-        for path in attachments:
-            if os.path.isfile(path):
-                send_attachment(chat_id, path)
-
-    if denials:
-        set_pending_prompt(state, chat_id, prompt)
-        lines = ["🚫 **Заблокировано** (нужно разрешение):"]
-        for d in denials[:10]:
-            lines.append(f"`{d.get('tool_name', '?')}`  {json.dumps(d.get('tool_input', {}))[:150]}")
-        lines.append("")
-        lines.append("/approve — повторить один раз с bypass")
-        lines.append("/approve session — включить bypass насовсем для этой сессии")
-        lines.append("/deny — оставить как есть")
-        send_message(chat_id, "\n".join(lines))
-    else:
-        clear_pending_prompt(state, chat_id)
+    send_turn_to_chat_process(chat_id, prompt, state, model, permission_mode, workspace, config_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1895,8 +2326,14 @@ def main():
             "✅ Перезагрузка окончена, бот готов к работе.",
         )
 
+    # Clean up any chat's persistent process on a real shutdown signal --
+    # see _shutdown_chat_processes' own docstring for why this can't be
+    # skipped (orphaned children otherwise survive every restart).
+    signal.signal(signal.SIGTERM, _shutdown_chat_processes)
+
     threading.Thread(target=_restart_watcher_loop, args=(state,), daemon=True).start()
     threading.Thread(target=_wakeup_watcher_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=_chat_proc_idle_reaper_loop, daemon=True).start()
 
     while True:
         try:
@@ -1914,7 +2351,6 @@ def main():
             continue
 
         if not r.get("ok"):
-            print(f"getUpdates not ok: {r}", flush=True)
             time.sleep(3)
             continue
 
@@ -1959,9 +2395,15 @@ def main():
                 cmd = text.strip().lower().lstrip("/.").split()[0] if text.strip() else ""
 
                 if cmd == "stop" and text.startswith(("/", ".")):
-                    proc = active_procs.get(chat_id)
-                    if proc and proc.poll() is None:
-                        proc.terminate()
+                    # Interrupting a turn now means killing the whole
+                    # persistent chat process, not just "this turn" (see
+                    # chat_procs) -- the reader thread's own finally-block
+                    # notices the stdout stream ended mid-turn and delivers
+                    # the "⏹ Остановлено" message itself; this is just the
+                    # immediate ack. Next message respawns fresh via
+                    # --resume onto the same session, so nothing is lost.
+                    if chat_id in busy_chats:
+                        _stop_chat_process(chat_id)
                         send_message(chat_id, "⏹ Прерываю текущий запрос...")
                     else:
                         send_message(chat_id, "Сейчас ничего не выполняется.")

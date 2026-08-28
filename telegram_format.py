@@ -7,6 +7,7 @@ hermes-agent gateway.
 """
 
 import re
+import secrets
 
 # ---------------------------------------------------------------------------
 # Escaping
@@ -155,11 +156,26 @@ def format_message(content: str) -> str:
     if not content:
         return content
 
+    # Random per-call nonce, verified absent from the real input before use
+    # -- a bare counter (\x00PH0\x00 etc) can collide with the SAME literal
+    # byte sequence if it's already present in attacker/tool-controlled
+    # content (e.g. Claude echoing file/tool output), silently corrupting
+    # step 11's restore (a real span of user text gets replaced by an
+    # unrelated protected fragment). Since `nonce` is verified not to occur
+    # anywhere in `content`, no string containing nonce as a substring can
+    # occur in `content` either, so the full key can never collide.
+    # Hex-only (no MarkdownV2 special chars) so step 10's escape pass, which
+    # runs on the whole text before placeholders are restored, never
+    # mangles the key itself.
+    nonce = secrets.token_hex(8)
+    while nonce in content:
+        nonce = secrets.token_hex(8)
+
     placeholders = {}
     counter = [0]
 
     def _ph(value):
-        key = f"\x00PH{counter[0]}\x00"
+        key = f"\x00PH{nonce}{counter[0]:04d}\x00"
         counter[0] += 1
         placeholders[key] = value
         return key
