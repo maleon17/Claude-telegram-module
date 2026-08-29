@@ -1,5 +1,6 @@
 # Runtime state -- per-deployment, never shared
 state*.json
+codex_bot_state.json
 whitelist.txt
 accounts/
 uploads_*/
