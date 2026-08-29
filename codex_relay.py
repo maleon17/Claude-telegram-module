@@ -8,10 +8,14 @@ import time
 import urllib.error
 import urllib.request
 
+from telegram_format import escape_mdv2, strip_mdv2
+
 
 EDIT_THROTTLE_S = 1.3
 MAX_MESSAGE_LEN = 4000  # Leave headroom below Telegram's 4096-char limit.
+RICH_MAX_CHARS = 30000
 HTTP_TIMEOUT_S = 20
+THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
 
 
 def log(message):
@@ -70,28 +74,40 @@ def compact(value, limit=1000):
     return text
 
 
-def format_item(item):
+def _rate_limited(result):
+    return result.get("error_code") == 429
+
+
+def item_label_and_blocks(item):
     item_type = item.get("type", "unknown")
     if item_type == "agent_message":
-        return f"💬 {compact(item.get('text', ''))}"
-    if item_type == "command_execution":
-        command = compact(item.get("command", ""), 700)
-        exit_code = item.get("exit_code")
-        status = "" if exit_code is None else f" (exit {exit_code})"
-        output = item.get("aggregated_output")
-        text = f"⚙️ {command}{status}"
-        if output not in (None, ""):
-            text += f"\n{compact(output, 1000)}"
-        return text
+        return "💬 Ответ", item.get("text", ""), []
     if item_type == "reasoning":
-        detail = item.get("text", item.get("summary", item))
-        return f"🧠 {compact(detail)}"
+        return "🧠 Размышление", item.get("text", item.get("summary", "")), []
+    if item_type == "command_execution":
+        command = item.get("command", "")
+        exit_code = item.get("exit_code")
+        output = item.get("aggregated_output")
+        results = []
+        if output not in (None, ""):
+            results.append(("📤 Результат", str(output)))
+        if exit_code is not None:
+            results.append(("🏁 Код завершения", str(exit_code)))
+        return "⚙️ Выполняю", command, results
     if item_type == "file_change":
-        detail = item.get("path", item.get("changes", item))
-        return f"📝 {compact(detail)}"
+        content = item.get("path", item.get("changes", item))
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        return "📝 Изменение файла", content, []
+    return f"🔧 {item_type}", json.dumps(item, ensure_ascii=False), []
 
-    # Item types are intentionally open-ended. Preserve all available data.
-    return f"• {item_type}: {compact(item)}"
+
+def render_process_item(item):
+    label, content, results = item_label_and_blocks(item)
+    lines = [f"{label}:", f"```\n{content}\n```"]
+    for result_label, result_content in results:
+        lines.extend((f"{result_label}:", f"```\n{result_content}\n```"))
+    return "\n".join(lines)
 
 
 def format_usage(usage):
@@ -109,79 +125,181 @@ def format_usage(usage):
     return ", ".join(parts) if parts else compact(usage, 300)
 
 
+def send_plain(text):
+    return tg_call("sendMessage", {"chat_id": CHAT_ID, "text": text[:MAX_MESSAGE_LEN]})
+
+
+def edit_plain(message_id, text):
+    return tg_call("editMessageText", {
+        "chat_id": CHAT_ID, "message_id": message_id, "text": text[:MAX_MESSAGE_LEN],
+    })
+
+
+def send_rich(markdown_text):
+    text = markdown_text[:RICH_MAX_CHARS]
+    result = tg_call("sendRichMessage", {
+        "chat_id": CHAT_ID, "rich_message": {"markdown": text},
+    })
+    if not result.get("ok") and not _rate_limited(result):
+        return send_plain(markdown_text)
+    return result
+
+
+def edit_rich(message_id, markdown_text):
+    text = markdown_text[:RICH_MAX_CHARS]
+    result = tg_call("editMessageText", {
+        "chat_id": CHAT_ID, "message_id": message_id,
+        "rich_message": {"markdown": text},
+    })
+    if not result.get("ok") and not _rate_limited(result):
+        description = str(result.get("description", "")).lower()
+        if "not modified" not in description:
+            return edit_plain(message_id, markdown_text)
+    return result
+
+
 class Relay:
     def __init__(self):
-        self.steps = []
+        self.items = []
+        self.process_items = []
+        self.draft_thought = None
+        self.draft_tool = None
         self.message_id = None
         self.last_request_at = 0.0
         self.finished = False
         self.usage = None
+        self.spinner_i = 0
 
     def add_event(self, event):
         event_type = event.get("type", "unknown")
         if event_type == "thread.started":
-            thread_id = event.get("thread_id")
-            self.steps.append(f"🧵 Поток запущен: {thread_id or 'без id'}")
+            pass
         elif event_type == "turn.started":
-            self.steps.append("▶️ Выполнение начато")
+            pass
+        elif event_type in ("item.started", "item.updated"):
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type in ("agent_message", "reasoning"):
+                    text = item.get("text", item.get("summary", ""))
+                    if text:
+                        self.draft_thought = text
+                else:
+                    self.draft_tool = item
         elif event_type == "item.completed":
             item = event.get("item")
             if isinstance(item, dict):
-                self.steps.append(format_item(item))
-            else:
-                self.steps.append(f"• item.completed: {compact(item)}")
+                self.items.append(item)
+                item_type = item.get("type")
+                if item_type in ("agent_message", "reasoning"):
+                    self.draft_thought = item.get("text", item.get("summary", ""))
+                else:
+                    self.draft_tool = item
+                self.process_items.append(item)
         elif event_type == "turn.completed":
             self.finished = True
             self.usage = event.get("usage")
-        else:
-            self.steps.append(f"• {event_type}: {compact(event)}")
 
     def render(self):
-        header = "✅ Codex завершён" if self.finished else "⏳ Codex работает — печатает…"
-        footer = ""
-        if self.finished and self.usage is not None:
-            footer = f"\n\nТокены: {format_usage(self.usage)}"
+        lines = []
+        if self.draft_thought:
+            lines.append(escape_mdv2(str(self.draft_thought)))
+        if self.draft_tool:
+            label, content, results = item_label_and_blocks(self.draft_tool)
+            lines.extend((escape_mdv2(f"{label}:"), f"```\n{content}\n```"))
+            for result_label, result_content in results:
+                lines.extend((escape_mdv2(f"{result_label}:"),
+                              f"```\n{result_content}\n```"))
+        body = "\n".join(lines) if lines else "Думаю"
+        frame = THINKING_SPINNER_FRAMES[self.spinner_i % len(THINKING_SPINNER_FRAMES)]
+        self.spinner_i += 1
+        return f"{frame} {body}"
 
-        available = MAX_MESSAGE_LEN - len(header) - len(footer) - 2
-        visible = []
-        if not self.steps:
-            return header + footer
-        for start in range(len(self.steps)):
-            candidate = self.steps[start:]
-            hidden = start
-            lines = ([f"…{hidden} шагов выше опущено"] if hidden else []) + candidate
-            if len("\n".join(lines)) <= available:
-                visible = lines
-                break
-        else:
-            # Even the newest single step is too large: retain its freshest tail.
-            hidden = max(0, len(self.steps) - 1)
-            marker = f"…{hidden} шагов выше опущено" if hidden else ""
-            room = available - len(marker) - (1 if marker else 0)
-            tail = "…" + self.steps[-1][-(room - 1):] if room > 1 else ""
-            visible = ([marker] if marker else []) + ([tail] if tail else [])
-
-        body = "\n".join(visible)
-        return header + (f"\n\n{body}" if body else "") + footer
+    def _send_or_edit_live(self, text):
+        if self.message_id is None:
+            result = tg_call("sendMessage", {
+                "chat_id": CHAT_ID, "text": text, "parse_mode": "MarkdownV2",
+            })
+            if not result.get("ok") and not _rate_limited(result):
+                result = tg_call("sendMessage", {
+                    "chat_id": CHAT_ID,
+                    "text": strip_mdv2(text).replace("```", ""),
+                })
+            if result.get("ok"):
+                self.message_id = result["result"]["message_id"]
+            return
+        params = {
+            "chat_id": CHAT_ID, "message_id": self.message_id,
+            "text": text, "parse_mode": "MarkdownV2",
+        }
+        result = tg_call("editMessageText", params)
+        if not result.get("ok") and not _rate_limited(result):
+            description = str(result.get("description", "")).lower()
+            if "not modified" not in description:
+                params["text"] = strip_mdv2(text).replace("```", "")
+                params.pop("parse_mode", None)
+                tg_call("editMessageText", params)
 
     def flush(self, force=False):
         now = time.monotonic()
         if not force and now - self.last_request_at < EDIT_THROTTLE_S:
             return
         self.last_request_at = now
-        text = self.render()
         try:
-            if self.message_id is None:
-                result = tg_call("sendMessage", {"chat_id": CHAT_ID, "text": text})
-                if result.get("ok"):
-                    self.message_id = result["result"]["message_id"]
-            else:
-                tg_call(
-                    "editMessageText",
-                    {"chat_id": CHAT_ID, "message_id": self.message_id, "text": text},
-                )
+            self._send_or_edit_live(self.render()[:MAX_MESSAGE_LEN])
         except Exception as exc:
             # Telegram must never stop consumption of the producer's pipe.
+            log(f"Telegram relay error: {exc}")
+
+    def deliver(self):
+        final_index = next(
+            (i for i in range(len(self.items) - 1, -1, -1)
+             if self.items[i].get("type") == "agent_message"), None
+        )
+        final_text = self.items[final_index].get("text", "") if final_index is not None else ""
+        process_items = list(self.process_items)
+        if final_index is not None:
+            final_item = self.items[final_index]
+            for i in range(len(process_items) - 1, -1, -1):
+                if process_items[i] is final_item:
+                    del process_items[i]
+                    break
+
+        answer = final_text or "(нет ответа — смотри процесс выше)"
+        if self.usage is not None:
+            answer += f"\n\nТокены: {format_usage(self.usage)}"
+
+        try:
+            if process_items:
+                process_steps = [render_process_item(item) for item in process_items]
+                closing_reserve = 100
+                visible = []
+                used = 0
+                for step in reversed(process_steps):
+                    cost = len(step) + 1
+                    if visible and used + cost > RICH_MAX_CHARS - closing_reserve:
+                        break
+                    visible.append(step[:RICH_MAX_CHARS - closing_reserve])
+                    used += cost
+                visible.reverse()
+                hidden = len(process_steps) - len(visible)
+                if hidden:
+                    visible.insert(0, f"…и ещё {hidden} шагов выше…")
+                body = "\n".join(visible)
+                rich = (
+                    f"<details><summary>🔧 Процесс ({len(process_steps)})</summary>\n"
+                    f"{body}\n</details>"
+                )
+                if self.message_id is not None:
+                    edit_rich(self.message_id, rich)
+                else:
+                    send_rich(rich)
+                send_rich(answer)
+            elif self.message_id is not None:
+                edit_rich(self.message_id, answer)
+            else:
+                send_rich(answer)
+        except Exception as exc:
             log(f"Telegram relay error: {exc}")
 
 
@@ -198,7 +316,10 @@ def main():
         except Exception as exc:
             log(f"JSONL parse error on line {line_number}: {exc}; line skipped")
             continue
-        relay.flush(force=event.get("type") == "turn.completed")
+        if event.get("type") == "turn.completed":
+            relay.deliver()
+        else:
+            relay.flush()
 
 
 if __name__ == "__main__":
