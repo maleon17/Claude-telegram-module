@@ -3,6 +3,7 @@
 
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -18,6 +19,9 @@ EDIT_THROTTLE_S = 1.3
 MAX_MESSAGE_LEN = 4000
 RICH_MAX_CHARS = 30000
 HTTP_TIMEOUT_S = 20
+IDLE_TIMEOUT_S = 300
+TOTAL_TIMEOUT_S = 1800
+PROCESS_WAIT_TIMEOUT_S = 5
 
 
 def log(message):
@@ -346,16 +350,80 @@ def run_turn(chat_id, prompt, thread_id):
         )
         with process_lock:
             current_process = proc
+
         def drain_stderr():
             for line in proc.stderr:
                 stderr_lines.append(line)
                 if len(stderr_lines) > 200:
                     del stderr_lines[:100]
 
+        stdout_queue = queue.Queue()
+
+        def read_stdout():
+            try:
+                for line in proc.stdout:
+                    stdout_queue.put(line)
+            finally:
+                stdout_queue.put(None)
+
         stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
         stderr_thread.start()
+        stdout_thread.start()
         view.flush(force=True)
-        for line_number, raw_line in enumerate(proc.stdout, 1):
+        started_at = time.monotonic()
+        last_output_at = started_at
+        line_number = 0
+        timeout_error = None
+        while True:
+            now = time.monotonic()
+            idle_remaining = IDLE_TIMEOUT_S - (now - last_output_at)
+            total_remaining = TOTAL_TIMEOUT_S - (now - started_at)
+            if idle_remaining <= 0:
+                timeout_error = (
+                    f"Codex завис и был принудительно остановлен "
+                    f"(таймаут {IDLE_TIMEOUT_S / 60:g} минут)"
+                )
+            elif total_remaining <= 0:
+                timeout_error = (
+                    f"Codex завис и был принудительно остановлен "
+                    f"(таймаут {TOTAL_TIMEOUT_S / 60:g} минут)"
+                )
+            if timeout_error:
+                log(timeout_error)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    return_code = proc.wait(timeout=PROCESS_WAIT_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    log(f"Codex process {proc.pid} did not exit after SIGKILL")
+                    return_code = -signal.SIGKILL
+                break
+
+            try:
+                raw_line = stdout_queue.get(
+                    timeout=min(1.0, idle_remaining, total_remaining)
+                )
+            except queue.Empty:
+                if proc.poll() is not None:
+                    # The direct child can exit while a descendant still holds
+                    # the inherited stdout pipe open. Reap the remaining group.
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return_code = proc.returncode
+                    break
+                continue
+            if raw_line is None:
+                if proc.poll() is not None:
+                    return_code = proc.returncode
+                    break
+                continue
+            last_output_at = time.monotonic()
+            line_number += 1
             if not raw_line.strip():
                 continue
             try:
@@ -366,14 +434,17 @@ def run_turn(chat_id, prompt, thread_id):
                 view.flush(force=event.get("type") == "turn.completed")
             except Exception as exc:
                 log(f"JSONL parse error on line {line_number}: {exc}; line skipped")
-        return_code = proc.wait()
+        if return_code is None:
+            return_code = proc.wait()
         stderr_thread.join(timeout=1)
         stderr_text = "".join(stderr_lines).strip()
         if stderr_text:
             log(f"Codex stderr: {stderr_text[-4000:]}")
-        stopped = return_code < 0
+        stopped = return_code < 0 and timeout_error is None
         error = None
-        if return_code != 0 and not stopped:
+        if timeout_error:
+            error = timeout_error
+        elif return_code != 0 and not stopped:
             error = compact(stderr_text or f"codex exited with status {return_code}", 1000)
         elif not view.completed and not stopped:
             error = "поток Codex завершился без события turn.completed"
