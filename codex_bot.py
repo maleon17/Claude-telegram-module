@@ -14,6 +14,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from telegram_format import escape_mdv2, strip_mdv2
+
 
 EDIT_THROTTLE_S = 1.3
 MAX_MESSAGE_LEN = 4000
@@ -22,6 +24,7 @@ HTTP_TIMEOUT_S = 20
 IDLE_TIMEOUT_S = 300
 TOTAL_TIMEOUT_S = 1800
 PROCESS_WAIT_TIMEOUT_S = 5
+THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
 
 
 def log(message):
@@ -151,24 +154,36 @@ def compact(value, limit=1000):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def format_item(item):
+def item_label_and_blocks(item):
     item_type = item.get("type", "unknown")
     if item_type == "agent_message":
-        return f"💬 {compact(item.get('text', ''))}"
-    if item_type == "command_execution":
-        command = compact(item.get("command", ""), 700)
-        exit_code = item.get("exit_code")
-        status = "" if exit_code is None else f" (exit {exit_code})"
-        output = item.get("aggregated_output")
-        text = f"⚙️ {command}{status}"
-        if output not in (None, ""):
-            text += f"\n{compact(output, 1000)}"
-        return text
+        return "💬 Ответ", item.get("text", ""), []
     if item_type == "reasoning":
-        return f"🧠 {compact(item.get('text', item.get('summary', item)))}"
+        return "🧠 Размышление", item.get("text", item.get("summary", "")), []
+    if item_type == "command_execution":
+        command = item.get("command", "")
+        exit_code = item.get("exit_code")
+        output = item.get("aggregated_output")
+        results = []
+        if output not in (None, ""):
+            results.append(("📤 Результат", str(output)))
+        if exit_code is not None:
+            results.append(("🏁 Код завершения", str(exit_code)))
+        return "⚙️ Выполняю", command, results
     if item_type == "file_change":
-        return f"📝 {compact(item.get('path', item.get('changes', item)))}"
-    return f"• {item_type}: {compact(item)}"
+        content = item.get("path", item.get("changes", item))
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        return "📝 Изменение файла", content, []
+    return f"🔧 {item_type}", json.dumps(item, ensure_ascii=False), []
+
+
+def render_process_item(item):
+    label, content, results = item_label_and_blocks(item)
+    lines = [f"{label}:", f"```\n{content}\n```"]
+    for result_label, result_content in results:
+        lines.extend((f"{result_label}:", f"```\n{result_content}\n```"))
+    return "\n".join(lines)
 
 
 def format_usage(usage):
@@ -227,11 +242,14 @@ class TurnView:
     def __init__(self, chat_id):
         self.chat_id = chat_id
         self.items = []
-        self.steps = []
+        self.process_items = []
+        self.draft_thought = None
+        self.draft_tool = None
         self.message_id = None
         self.last_edit_at = 0.0
         self.usage = None
         self.completed = False
+        self.spinner_i = 0
 
     def add_event(self, event):
         event_type = event.get("type", "unknown")
@@ -239,45 +257,79 @@ class TurnView:
             thread_id = event.get("thread_id")
             if thread_id:
                 save_thread_id(thread_id)
-            self.steps.append(f"🧵 Поток запущен: {thread_id or 'без id'}")
         elif event_type == "turn.started":
-            self.steps.append("▶️ Выполнение начато")
+            pass
+        elif event_type in ("item.started", "item.updated"):
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type in ("agent_message", "reasoning"):
+                    text = item.get("text", item.get("summary", ""))
+                    if text:
+                        self.draft_thought = text
+                else:
+                    self.draft_tool = item
         elif event_type == "item.completed":
             item = event.get("item")
             if isinstance(item, dict):
                 self.items.append(item)
-                self.steps.append(format_item(item))
-            else:
-                self.steps.append(f"• item.completed: {compact(item)}")
+                item_type = item.get("type")
+                if item_type in ("agent_message", "reasoning"):
+                    self.draft_thought = item.get("text", item.get("summary", ""))
+                else:
+                    self.draft_tool = item
+                self.process_items.append(item)
         elif event_type == "turn.completed":
             self.completed = True
             self.usage = event.get("usage")
-        else:
-            self.steps.append(f"• {event_type}: {compact(event)}")
 
     def live_text(self):
-        header = "⏳ Codex работает..."
-        available = MAX_MESSAGE_LEN - len(header) - 2
-        for start in range(len(self.steps) + 1):
-            visible = self.steps[start:]
-            if start:
-                visible = [f"…{start} шагов выше опущено"] + visible
-            body = "\n".join(visible)
-            if len(body) <= available:
-                return header + (f"\n\n{body}" if body else "")
-        return header
+        lines = []
+        if self.draft_thought:
+            lines.append(escape_mdv2(str(self.draft_thought)))
+        if self.draft_tool:
+            label, content, results = item_label_and_blocks(self.draft_tool)
+            lines.extend((escape_mdv2(f"{label}:"), f"```\n{content}\n```"))
+            for result_label, result_content in results:
+                lines.extend((escape_mdv2(f"{result_label}:"),
+                              f"```\n{result_content}\n```"))
+        body = "\n".join(lines) if lines else "Думаю"
+        frame = THINKING_SPINNER_FRAMES[self.spinner_i % len(THINKING_SPINNER_FRAMES)]
+        self.spinner_i += 1
+        return f"{frame} {body}"
+
+    def _send_or_edit_live(self, text):
+        if self.message_id is None:
+            result = tg_call("sendMessage", {
+                "chat_id": self.chat_id, "text": text,
+                "parse_mode": "MarkdownV2",
+            })
+            if not result.get("ok") and not _rate_limited(result):
+                result = tg_call("sendMessage", {
+                    "chat_id": self.chat_id,
+                    "text": strip_mdv2(text).replace("```", ""),
+                })
+            if result.get("ok"):
+                self.message_id = result["result"]["message_id"]
+            return
+        params = {
+            "chat_id": self.chat_id, "message_id": self.message_id,
+            "text": text, "parse_mode": "MarkdownV2",
+        }
+        result = tg_call("editMessageText", params)
+        if not result.get("ok") and not _rate_limited(result):
+            description = str(result.get("description", "")).lower()
+            if "not modified" not in description:
+                params["text"] = strip_mdv2(text).replace("```", "")
+                params.pop("parse_mode", None)
+                tg_call("editMessageText", params)
 
     def flush(self, force=False):
         now = time.monotonic()
         if not force and now - self.last_edit_at < EDIT_THROTTLE_S:
             return
         self.last_edit_at = now
-        if self.message_id is None:
-            result = send_plain(self.chat_id, self.live_text())
-            if result and result.get("ok"):
-                self.message_id = result["result"]["message_id"]
-        else:
-            edit_plain(self.chat_id, self.message_id, self.live_text())
+        self._send_or_edit_live(self.live_text()[:MAX_MESSAGE_LEN])
 
     def deliver(self, stopped=False, error=None):
         final_index = next(
@@ -286,12 +338,12 @@ class TurnView:
         )
         final_text = self.items[final_index].get("text", "") if final_index is not None else ""
 
-        process_steps = list(self.steps)
+        process_items = list(self.process_items)
         if final_index is not None:
-            final_rendered = format_item(self.items[final_index])
-            for i in range(len(process_steps) - 1, -1, -1):
-                if process_steps[i] == final_rendered:
-                    del process_steps[i]
+            final_item = self.items[final_index]
+            for i in range(len(process_items) - 1, -1, -1):
+                if process_items[i] is final_item:
+                    del process_items[i]
                     break
 
         if stopped:
@@ -303,7 +355,8 @@ class TurnView:
         if self.usage is not None:
             answer += f"\n\nТокены: {format_usage(self.usage)}"
 
-        if process_steps:
+        if process_items:
+            process_steps = [render_process_item(item) for item in process_items]
             closing_reserve = 100
             visible = []
             used = 0
