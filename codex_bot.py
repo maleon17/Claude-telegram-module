@@ -440,8 +440,16 @@ def handle_message(message):
     threading.Thread(target=run_turn, args=(chat_id, text, thread_id), daemon=True).start()
 
 
+def register_commands():
+    tg_call("setMyCommands", {"commands": [
+        {"command": "new", "description": "Сбросить текущий Codex-тред"},
+        {"command": "stop", "description": "Остановить текущее выполнение"},
+    ]})
+
+
 def main():
     offset = None
+    register_commands()
     log(f"Codex Telegram bot started; owner={OWNER_ID}, cwd={CODEX_CWD}")
     while True:
         params = {"timeout": 30, "allowed_updates": ["message"]}
