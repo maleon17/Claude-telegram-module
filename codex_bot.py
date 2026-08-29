@@ -64,7 +64,17 @@ def _rate_limited(result):
 
 
 def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
-    """Call Telegram once; never retry, or call at all during a known 429 ban."""
+    """Call Telegram once; never retry, or call at all during a known 429 ban.
+
+    `telegram_lock` guards only the tiny rate_limit_until read/write -- NOT
+    the network call itself. main()'s own getUpdates is a 30-40s long poll
+    that also goes through this function; holding a lock across the actual
+    HTTP request would serialize every other thread's sendMessage/edit
+    behind that poll for its entire duration, which is exactly what
+    happened here (confirmed live via py-spy: run_turn's first live-progress
+    edit sat blocked on this lock while the main loop held it inside
+    urlopen()). The lock only needs to protect the shared counter.
+    """
     global rate_limit_until
     with telegram_lock:
         now = time.monotonic()
@@ -79,37 +89,38 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
             log(f"Telegram {method} suppressed: rate-limited for ~{remaining} more seconds")
             return result
 
-        request = urllib.request.Request(
-            f"{API_BASE}/{method}",
-            data=json.dumps(params or {}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
+    request = urllib.request.Request(
+        f"{API_BASE}/{method}",
+        data=json.dumps(params or {}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            try:
-                result = json.loads(exc.read().decode("utf-8"))
-            except Exception:
-                result = {"ok": False, "error": str(exc)}
-        except Exception as exc:
+            result = json.loads(exc.read().decode("utf-8"))
+        except Exception:
             result = {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
 
-        if not result.get("ok"):
-            if _rate_limited(result):
-                retry_after = (result.get("parameters") or {}).get("retry_after")
-                try:
-                    delay = max(1.0, float(retry_after))
-                except (TypeError, ValueError):
-                    delay = 1.0
+    if not result.get("ok"):
+        if _rate_limited(result):
+            retry_after = (result.get("parameters") or {}).get("retry_after")
+            try:
+                delay = max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                delay = 1.0
+            with telegram_lock:
                 rate_limit_until = max(rate_limit_until, time.monotonic() + delay)
-                log(
-                    f"Telegram {method} not ok: 429 Too Many Requests; "
-                    f"bot rate-limited for {retry_after} seconds: {result}"
-                )
-            else:
-                log(f"Telegram {method} not ok: {result}")
-        return result
+            log(
+                f"Telegram {method} not ok: 429 Too Many Requests; "
+                f"bot rate-limited for {retry_after} seconds: {result}"
+            )
+        else:
+            log(f"Telegram {method} not ok: {result}")
+    return result
 
 
 def load_state():
