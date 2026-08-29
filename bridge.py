@@ -238,7 +238,11 @@ def main():
                 continue
 
             try:
-                cmd = text.strip().lower().lstrip("/.").split()[0] if text.strip() else ""
+                # A bare "." or "/" becomes empty after removing the
+                # command prefix.  Guard the split so malformed/placeholder
+                # Telegram messages cannot abort this update cycle.
+                normalized_text = text.strip().lower().lstrip("/.")
+                cmd = normalized_text.split()[0] if normalized_text else ""
 
                 if cmd == "stop" and text.startswith(("/", ".")):
                     # Interrupting a turn now means killing the whole
