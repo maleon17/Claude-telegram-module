@@ -25,6 +25,18 @@ IDLE_TIMEOUT_S = 300
 TOTAL_TIMEOUT_S = 1800
 PROCESS_WAIT_TIMEOUT_S = 5
 THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
+COMMANDS = [
+    ("new", "Начать новую Codex-сессию"),
+    ("sessions", "Список последних сессий"),
+    ("resume", "Продолжить сессию по id"),
+    ("status", "Сессия, модель, sandbox и workspace"),
+    ("stop", "Прервать текущий запрос"),
+    ("usage", "Токены последнего запроса"),
+    ("model", "Выбрать модель Codex"),
+    ("mode", "Sandbox: read-only/workspace-write/full"),
+    ("workspace", "Рабочая директория"),
+    ("restart", "Перезапустить Codex-бота"),
+]
 
 
 def log(message):
@@ -125,11 +137,17 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
 
 def load_state():
     if not STATE_FILE.exists():
-        return {"thread_id": None}
+        return {"thread_id": None, "model": None, "sandbox": CODEX_SANDBOX,
+                "workspace": CODEX_CWD, "last_usage": None}
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         thread_id = data.get("thread_id") if isinstance(data, dict) else None
-        return {"thread_id": thread_id if isinstance(thread_id, str) else None}
+        return {"thread_id": thread_id if isinstance(thread_id, str) else None,
+                "model": data.get("model") if isinstance(data.get("model"), str) else None,
+                "sandbox": data.get("sandbox") if data.get("sandbox") in
+                ("read-only", "workspace-write", "danger-full-access") else CODEX_SANDBOX,
+                "workspace": data.get("workspace") if isinstance(data.get("workspace"), str) else CODEX_CWD,
+                "last_usage": data.get("last_usage") if isinstance(data.get("last_usage"), dict) else None}
     except Exception as exc:
         raise SystemExit(f"codex_bot.py: cannot read state file {STATE_FILE}: {exc}") from exc
 
@@ -137,9 +155,9 @@ def load_state():
 state = load_state()
 
 
-def save_thread_id(thread_id):
+def update_state(**values):
     with state_lock:
-        state["thread_id"] = thread_id
+        state.update(values)
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=STATE_FILE.name + ".", dir=STATE_FILE.parent)
         try:
@@ -155,6 +173,10 @@ def save_thread_id(thread_id):
             except FileNotFoundError:
                 pass
             raise
+
+
+def save_thread_id(thread_id):
+    update_state(thread_id=thread_id)
 
 
 def compact(value, limit=1000):
@@ -256,7 +278,7 @@ class TurnView:
         self.process_items = []
         self.draft_thought = None
         self.draft_tool = None
-        self.message_id = None
+        self.draft_id = int(time.time_ns() % 2147483647) or 1
         self.last_edit_at = 0.0
         self.usage = None
         self.completed = False
@@ -293,6 +315,8 @@ class TurnView:
         elif event_type == "turn.completed":
             self.completed = True
             self.usage = event.get("usage")
+            if isinstance(self.usage, dict):
+                update_state(last_usage=self.usage)
 
     def live_text(self):
         lines = []
@@ -305,42 +329,25 @@ class TurnView:
                 lines.extend((escape_mdv2(f"{result_label}:"),
                               f"```\n{result_content}\n```"))
         body = "\n".join(lines) if lines else "Думаю"
-        frame = THINKING_SPINNER_FRAMES[self.spinner_i % len(THINKING_SPINNER_FRAMES)]
-        self.spinner_i += 1
-        return f"{frame} {body}"
+        return body  # Telegram animates native drafts itself
 
-    def _send_or_edit_live(self, text):
-        if self.message_id is None:
-            result = tg_call("sendMessage", {
-                "chat_id": self.chat_id, "text": text,
-                "parse_mode": "MarkdownV2",
-            })
-            if not result.get("ok") and not _rate_limited(result):
-                result = tg_call("sendMessage", {
-                    "chat_id": self.chat_id,
-                    "text": strip_mdv2(text).replace("```", ""),
-                })
-            if result.get("ok"):
-                self.message_id = result["result"]["message_id"]
-            return
-        params = {
-            "chat_id": self.chat_id, "message_id": self.message_id,
+    def _send_live_draft(self, text):
+        result = tg_call("sendMessageDraft", {
+            "chat_id": self.chat_id, "draft_id": self.draft_id,
             "text": text, "parse_mode": "MarkdownV2",
-        }
-        result = tg_call("editMessageText", params)
+        })
         if not result.get("ok") and not _rate_limited(result):
-            description = str(result.get("description", "")).lower()
-            if "not modified" not in description:
-                params["text"] = strip_mdv2(text).replace("```", "")
-                params.pop("parse_mode", None)
-                tg_call("editMessageText", params)
+            tg_call("sendMessageDraft", {
+                "chat_id": self.chat_id, "draft_id": self.draft_id,
+                "text": strip_mdv2(text).replace("```", ""),
+            })
 
     def flush(self, force=False):
         now = time.monotonic()
         if not force and now - self.last_edit_at < EDIT_THROTTLE_S:
             return
         self.last_edit_at = now
-        self._send_or_edit_live(self.live_text()[:MAX_MESSAGE_LEN])
+        self._send_live_draft(self.live_text()[:MAX_MESSAGE_LEN])
 
     def deliver(self, stopped=False, error=None):
         final_index = next(
@@ -383,20 +390,21 @@ class TurnView:
                 visible.insert(0, f"…и ещё {hidden} шагов выше…")
             body = "\n".join(visible)
             rich = f"<details><summary>🔧 Процесс ({len(process_steps)})</summary>\n{body}\n</details>"
-            if self.message_id is not None:
-                edit_rich(self.chat_id, self.message_id, rich)
-            else:
-                send_rich(self.chat_id, rich)
+            send_rich(self.chat_id, rich)
             send_rich(self.chat_id, answer)
-        elif self.message_id is not None:
-            edit_rich(self.chat_id, self.message_id, answer)
         else:
             send_rich(self.chat_id, answer)
 
 
 def build_codex_command(prompt, thread_id):
-    base = ["codex", "exec", "--json", "--sandbox", CODEX_SANDBOX,
-            "--skip-git-repo-check", "--cd", CODEX_CWD]
+    with state_lock:
+        sandbox = state.get("sandbox") or CODEX_SANDBOX
+        workspace = state.get("workspace") or CODEX_CWD
+        model = state.get("model")
+    base = ["codex", "exec", "--json", "--sandbox", sandbox,
+            "--skip-git-repo-check", "--cd", workspace]
+    if model:
+        base += ["--model", model]
     return base + (["resume", thread_id, prompt] if thread_id else [prompt])
 
 
@@ -525,28 +533,133 @@ def run_turn(chat_id, prompt, thread_id):
             busy = False
 
 
+def session_files():
+    root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+    return sorted(root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def session_info(path):
+    sid, preview = path.stem, ""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                obj = json.loads(line)
+                payload = obj.get("payload", {})
+                if obj.get("type") == "session_meta":
+                    sid = payload.get("id", sid)
+                elif obj.get("type") == "response_item" and payload.get("role") == "user":
+                    texts = [part.get("text", "") for part in payload.get("content", [])
+                             if part.get("type") == "input_text"]
+                    candidate = " ".join(texts).strip()
+                    if candidate and not candidate.startswith("<recommended_plugins>"):
+                        preview = compact(candidate, 55)
+    except Exception:
+        pass
+    return sid, preview
+
+
+def restart_self():
+    time.sleep(0.5)  # let Telegram receive the acknowledgement first
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def stop_current_process():
+    with process_lock:
+        proc = current_process
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                return True
+            except ProcessLookupError:
+                pass
+    return False
+
+
 def handle_command(chat_id, command):
     global busy
-    command = command.split()[0].split("@", 1)[0].lower()
-    if command == "/new":
+    raw_cmd, _, arg = command.partition(" ")
+    cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
+    arg = arg.strip()
+    if cmd in ("start", "help"):
+        send_plain(chat_id, "Codex Telegram bridge. Команды доступны в меню бота.")
+        return True
+    if cmd == "new":
+        stop_current_process()
         save_thread_id(None)
         send_plain(chat_id, "🆕 Текущий Codex-тред сброшен. Следующее сообщение начнёт новый.")
         return True
-    if command == "/stop":
-        with process_lock:
-            proc = current_process
-            running = busy and proc is not None and proc.poll() is None
-            if running:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    running = False
+    if cmd == "sessions":
+        current = state.get("thread_id")
+        rows = []
+        for path in session_files()[:10]:
+            sid, preview = session_info(path)
+            rows.append(f"{sid[:8]}{' ← текущая' if sid == current else ''}  {preview}")
+        send_plain(chat_id, "Последние сессии:\n" + ("\n".join(rows) or "не найдены"))
+        return True
+    if cmd == "resume":
+        matches = [sid for path in session_files() for sid, _ in [session_info(path)]
+                   if arg and sid.startswith(arg)]
+        if len(matches) != 1:
+            send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")
+        else:
+            stop_current_process()
+            save_thread_id(matches[0])
+            send_plain(chat_id, f"Продолжаю сессию {matches[0][:8]}.")
+        return True
+    if cmd == "status":
+        with state_lock:
+            snapshot = dict(state)
+        send_plain(chat_id, "ℹ️ Статус\n"
+                   f"Сессия: {(snapshot.get('thread_id') or 'нет')[:8]}\n"
+                   f"Модель: {snapshot.get('model') or 'default'}\n"
+                   f"Sandbox: {snapshot.get('sandbox')}\n"
+                   f"Workspace: {snapshot.get('workspace')}\n"
+                   f"Занят: {'да' if busy else 'нет'}")
+        return True
+    if cmd == "usage":
+        with state_lock:
+            usage = state.get("last_usage")
+        send_plain(chat_id, "Токены последнего запроса: " + (format_usage(usage) if usage else "данных пока нет"))
+        return True
+    if cmd == "model":
+        update_state(model=None if arg.lower() in ("", "default") else arg)
+        send_plain(chat_id, f"Модель: {state.get('model') or 'default'}.")
+        return True
+    if cmd == "mode":
+        aliases = {"read": "read-only", "read-only": "read-only", "write": "workspace-write",
+                   "workspace-write": "workspace-write", "full": "danger-full-access",
+                   "danger-full-access": "danger-full-access"}
+        if arg not in aliases:
+            send_plain(chat_id, "Использование: /mode read-only|workspace-write|full")
+        else:
+            update_state(sandbox=aliases[arg])
+            send_plain(chat_id, f"Sandbox: {aliases[arg]}.")
+        return True
+    if cmd == "workspace":
+        path = CODEX_CWD if arg.lower() == "default" else os.path.abspath(os.path.expanduser(arg))
+        if not arg:
+            send_plain(chat_id, f"Workspace: {state.get('workspace')}\nИспользование: /workspace <путь>|default")
+        elif not os.path.isdir(path):
+            send_plain(chat_id, f"Директория не существует: {path}")
+        else:
+            update_state(workspace=path)
+            send_plain(chat_id, f"Workspace: {path}")
+        return True
+    if cmd == "restart":
+        send_plain(chat_id, "🔄 Перезапускаю Codex-бота…")
+        threading.Thread(target=restart_self, daemon=True).start()
+        return True
+    if cmd == "stop":
+        running = stop_current_process()
         if running:
             send_plain(chat_id, "⏹ Останавливаю текущее выполнение Codex.")
         else:
             send_plain(chat_id, "Сейчас нечего останавливать.")
         return True
-    return command.startswith("/")
+    if raw_cmd.startswith(("/", ".")):
+        send_plain(chat_id, "Неизвестная команда. Открой меню команд Telegram.")
+        return True
+    return False
 
 
 def handle_message(message):
@@ -558,7 +671,7 @@ def handle_message(message):
     if not isinstance(text, str) or not text.strip():
         return
     text = text.strip()
-    if text.startswith("/"):
+    if text.startswith(("/", ".")):
         handle_command(chat_id, text)
         return
     with process_lock:
@@ -576,10 +689,9 @@ def handle_message(message):
 
 
 def register_commands():
-    tg_call("setMyCommands", {"commands": [
-        {"command": "new", "description": "Сбросить текущий Codex-тред"},
-        {"command": "stop", "description": "Остановить текущее выполнение"},
-    ]})
+    payload = {"commands": [{"command": c, "description": d} for c, d in COMMANDS]}
+    tg_call("setMyCommands", payload)
+    tg_call("setMyCommands", {**payload, "scope": {"type": "all_private_chats"}})
 
 
 def main():
