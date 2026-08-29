@@ -92,14 +92,18 @@ def item_label_and_blocks(item):
         if output not in (None, ""):
             results.append(("📤 Результат", str(output)))
         if exit_code is not None:
-            results.append(("🏁 Код завершения", str(exit_code)))
-        return "⚙️ Выполняю", command, results
+            try:
+                succeeded = int(exit_code) == 0
+            except (TypeError, ValueError):
+                succeeded = False
+            results.append(("✅ Код завершения" if succeeded else "❌ Код завершения", str(exit_code)))
+        return "🔧 Bash", command, results
     if item_type == "file_change":
         content = item.get("path", item.get("changes", item))
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
         return "📝 Изменение файла", content, []
-    return f"🔧 {item_type}", json.dumps(item, ensure_ascii=False), []
+    return "🔧 Инструмент", str(item_type).replace("_", " "), []
 
 
 def render_process_item(item):
@@ -203,10 +207,12 @@ class Relay:
     def render(self):
         lines = []
         if self.draft_thought:
-            lines.append(escape_mdv2(str(self.draft_thought)))
+            lines.append(escape_mdv2(f"✍️ {self.draft_thought}"))
         if self.draft_tool:
             label, content, results = item_label_and_blocks(self.draft_tool)
-            lines.extend((escape_mdv2(f"{label}:"), f"```\n{content}\n```"))
+            lines.append(escape_mdv2(f"{label}:"))
+            if content:
+                lines.append(f"```\n{content}\n```")
             for result_label, result_content in results:
                 lines.extend((escape_mdv2(f"{result_label}:"),
                               f"```\n{result_content}\n```"))
