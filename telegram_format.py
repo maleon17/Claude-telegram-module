@@ -21,6 +21,38 @@ def escape_mdv2(text: str) -> str:
     return _MDV2_ESCAPE_RE.sub(r'\\\1', text)
 
 
+_BACKTICK_RUN_RE = re.compile(r'`+')
+
+
+def fenced_code(content: str, language: str = "") -> str:
+    """Wrap `content` in a Markdown fence long enough that a backtick run
+    already inside it (very common for real code/diffs/tool output -- the
+    exact content this is used for) can't prematurely close the fence and
+    scramble everything rendered after it. Same failure shape as the nested
+    `<blockquote>` bug fixed elsewhere in this project: an inner delimiter
+    that collides with the outer one corrupts everything downstream, not
+    just the one block."""
+    longest_run = max((len(m.group()) for m in _BACKTICK_RUN_RE.finditer(content)), default=0)
+    fence = "`" * max(3, longest_run + 1)
+    return f"{fence}{language}\n{content}\n{fence}"
+
+
+def mdv2_fenced_code(content: str) -> str:
+    """Wrap `content` in a pre block for `parse_mode="MarkdownV2"` specifically
+    (the live-progress ticker path) -- NOT the same as fenced_code() above,
+    which targets sendRichMessage's `rich_message.markdown` dialect.
+    MarkdownV2's own spec only recognizes an exact ``` as the fence
+    delimiter (no CommonMark-style variable-length fences), so a longer
+    fence does nothing here -- confirmed live 2026-08-30 (used fenced_code()
+    in this path by mistake and got a real 400: "Can't find end of Code
+    entity"). The spec also requires backslash and backtick to be escaped
+    inside pre/code entities; escaping every backtick has the side effect
+    of breaking up any inner run that would otherwise close the fence
+    early, which is what actually matters here."""
+    safe = content.replace("\\", "\\\\").replace("`", "\\`")
+    return f"```\n{safe}\n```"
+
+
 def strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escape backslashes to produce clean plain text."""
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)

@@ -20,12 +20,12 @@ from telegram_api import (
     edit_rich, extract_existing_files, send_attachment, send_message, send_rich,
     tg_call,
 )
-from telegram_format import escape_mdv2, strip_mdv2
+from telegram_format import escape_mdv2, fenced_code, mdv2_fenced_code, strip_mdv2
 
 def tool_call_line(name, tool_input):
     if name == "Bash":
         cmd = tool_input.get("command", "")[:500]
-        return f"🔧 Bash:\n```\n{cmd}\n```"
+        return f"🔧 Bash:\n{fenced_code(cmd)}"
     if name in ("Read",):
         return f"📖 Read: `{tool_input.get('file_path', '')}`"
     if name in ("Write", "Edit"):
@@ -35,7 +35,7 @@ def tool_call_line(name, tool_input):
     if name in ("WebFetch",):
         return f"🌐 WebFetch: `{tool_input.get('url', '')}`"
     keys_preview = json.dumps(tool_input, ensure_ascii=False)[:300]
-    return f"🔧 {name}:\n```\n{keys_preview}\n```"
+    return f"🔧 {name}:\n{fenced_code(keys_preview)}"
 
 
 def draft_tool_label_and_content(name, tool_input):
@@ -91,65 +91,64 @@ def _new_turn_accumulator(state, chat_id):
         # message_id of the live progress message this turn (see
         # _flush_draft) -- None until the first flush sends it.
         "progress_msg_id": None,
+        "progress_attempted": False,
         # Braille-spinner frame index (see THINKING_SPINNER_FRAMES) --
         # advances on every actual send/edit, purely cosmetic "still alive"
         # signal now that we no longer get Telegram's own native draft
         # animation for free.
         "spinner_i": 0,
+        "progress_lock": threading.Lock(),
     }
 
 
 def _flush_draft(chat_id, ts, force=False):
-    # Plain sendMessage + editMessageText for live progress -- swapped away
-    # from sendMessageDraft (Bot API 9.3/9.5, and its can_stop/
-    # stopped_message_generation follow-up) on 2026-08-28 after it proved
-    # unreliable in real use: it occupies the RECIPIENT's own compose box
-    # while streaming (confirmed live -- send button gone entirely, "три
-    # точки" indicator instead), with wildly inconsistent behavior across
-    # attempts/clients in the same session (blocked, then not blocked, then
-    # no visible progress at all -- can_stop's button never rendered on the
-    # owner's client despite the API accepting the parameter). A real,
-    # persisted message never touches the compose box and has none of that
-    # flakiness -- this is what live progress used to be before drafts, and
-    # what it's going back to. The message gets deleted once the turn's
-    # real process-log + answer are sent (see _deliver_turn_result) so it
-    # doesn't linger as stale clutter.
-    now = time.time()
-    if not force and (now - ts["last_draft_edit"]) < EDIT_THROTTLE_S:
-        return
+    # Show a static 🤔 prefix, but keep the useful tool/result snapshot.  The
+    # old spinner edited the message continuously; updates now happen only
+    # when real stream data arrives and are globally throttled per turn.
     lines = []
     if ts["draft_thought"]:
         lines.append(escape_mdv2(ts["draft_thought"]))
     if ts["draft_cmd"]:
         lines.append(escape_mdv2(f"{ts['draft_cmd_label']}:"))
-        lines.append(f"```\n{ts['draft_cmd']}\n```")
+        lines.append(mdv2_fenced_code(ts['draft_cmd']))
         for label, content in ts["draft_res_blocks"]:
             lines.append(escape_mdv2(f"{label}:"))
-            lines.append(f"```\n{content}\n```")
+            lines.append(mdv2_fenced_code(content))
     body = "\n".join(lines) if lines else "Думаю"
-    frame = THINKING_SPINNER_FRAMES[ts["spinner_i"] % len(THINKING_SPINNER_FRAMES)]
-    ts["spinner_i"] += 1
-    text = f"{frame} {body}"
+    text = f"🤔 {body}"
 
-    if ts["progress_msg_id"] is None:
-        r = tg_call("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2"})
-        if not r.get("ok"):
-            r = tg_call("sendMessage", {"chat_id": chat_id, "text": strip_mdv2(text).replace("```", "")})
-        if r.get("ok"):
-            ts["progress_msg_id"] = r["result"]["message_id"]
-    else:
-        params = {
-            "chat_id": chat_id, "message_id": ts["progress_msg_id"],
-            "text": text, "parse_mode": "MarkdownV2",
-        }
-        r = tg_call("editMessageText", params)
-        if not r.get("ok"):
-            desc = str(r.get("description", "")).lower()
-            if "not modified" not in desc:
-                params["text"] = strip_mdv2(text).replace("```", "")
-                params.pop("parse_mode", None)
-                tg_call("editMessageText", params)
-    ts["last_draft_edit"] = now
+    with ts["progress_lock"]:
+        now = time.time()
+        if (
+            ts["progress_msg_id"] is not None
+            and now - ts["last_draft_edit"] < EDIT_THROTTLE_S
+        ):
+            return
+        if ts["progress_msg_id"] is None:
+            if ts["progress_attempted"]:
+                return
+            ts["progress_attempted"] = True
+            r = tg_call(
+                "sendMessage",
+                {"chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2"},
+            )
+            if not r.get("ok") and r.get("error_code") != 429:
+                r = tg_call("sendMessage", {"chat_id": chat_id, "text": text})
+            if r.get("ok"):
+                ts["progress_msg_id"] = r["result"]["message_id"]
+        else:
+            params = {
+                "chat_id": chat_id, "message_id": ts["progress_msg_id"],
+                "text": text, "parse_mode": "MarkdownV2",
+            }
+            r = tg_call("editMessageText", params)
+            if not r.get("ok"):
+                desc = str(r.get("description", "")).lower()
+                if "not modified" not in desc and r.get("error_code") != 429:
+                    params["text"] = strip_mdv2(text).replace("```", "")
+                    params.pop("parse_mode", None)
+                    tg_call("editMessageText", params)
+        ts["last_draft_edit"] = now
 
 
 def _compact_draft_watchdog(chat_id, ts):
@@ -193,7 +192,7 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
     ):
         del log_lines[ts["last_text_log_index"]]
 
-    progress_became_process_block = False
+    process_rich_text = None
     if log_lines:
         MAIN_BUDGET = 30000
         LAST_TOOL_RESERVE = 2000
@@ -211,17 +210,10 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
         body_lines = [f"…и ещё {hidden} шагов выше…"] if hidden > 0 else []
         body_lines.extend(visible)
         body = "\n".join(body_lines)
-        rich_text = f"<details><summary>🔧 Процесс ({len(log_lines)})</summary>\n{body}\n</details>"
-        if ts["progress_msg_id"] is not None:
-            # Turn the live-progress message itself INTO the collapsible
-            # process-log block, in place, instead of deleting it and
-            # sending a separate new message -- one fewer message in the
-            # chat, and the transition reads as "this IS what it was
-            # building the whole time" rather than a swap.
-            edit_rich(chat_id, ts["progress_msg_id"], rich_text)
-            progress_became_process_block = True
-        else:
-            send_rich(chat_id, rich_text)
+        process_rich_text = (
+            f"<details><summary>🔧 Процесс ({len(log_lines)})</summary>\n"
+            f"{body}\n</details>"
+        )
 
     if ts["current_session_id"]:
         with chat_procs_lock:
@@ -246,6 +238,20 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
     else:
         text_out = final_text if final_text is not None else "(нет ответа — смотри процесс выше)"
 
+    progress_became_process_block = False
+    if process_rich_text:
+        if ts["progress_msg_id"] is not None:
+            # Turn the live-progress message itself INTO the collapsible
+            # process-log block, in place, instead of deleting it and
+            # sending a separate new message -- one fewer message in the
+            # chat, and the transition reads as "this IS what it was
+            # building the whole time" rather than a swap.
+            edit_rich(chat_id, ts["progress_msg_id"], process_rich_text)
+            progress_became_process_block = True
+        else:
+            send_rich(chat_id, process_rich_text)
+
+    final_payload = text_out or "(пусто)"
     if ts["progress_msg_id"] is not None and not progress_became_process_block:
         # Either there was no tool-call content at all (a plain
         # conversational turn), or there was but it already got absorbed
@@ -255,9 +261,16 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
         # message (caught live 2026-08-28: that delete+resend was visibly
         # flickering -- the answer would flash as the progress message,
         # vanish, then reappear as a "new" one a beat later).
-        edit_rich(chat_id, ts["progress_msg_id"], text_out or "(пусто)")
+        edit_rich(chat_id, ts["progress_msg_id"], final_payload)
     else:
-        send_rich(chat_id, text_out or "(пусто)")
+        # A genuinely NEW message here is deliberate, not incidental: an
+        # edit does not push a Telegram notification, a fresh sendMessage
+        # does. Reverted 2026-08-30 -- a since-uncommitted change merged
+        # the process block and the answer into one edited card to save a
+        # message, which silently killed the "your answer is ready"
+        # notification for every tool-using turn (the user only ever got
+        # pinged by the initial "🤔 Думаю" placeholder, then nothing).
+        send_rich(chat_id, final_payload)
 
     if not stopped:
         attachments = list(ts["written_files"])
@@ -466,11 +479,11 @@ def _chat_reader_loop(chat_id, state, record):
                             res_blocks = []
                             if stdout_text:
                                 preview = stdout_text[:400]
-                                log_parts.append(f"✅ StdOut:\n```\n{preview}\n```")
+                                log_parts.append(f"✅ StdOut:\n{fenced_code(preview)}")
                                 res_blocks.append(("✅ StdOut", _draft_clean(preview)))
                             if stderr_text:
                                 preview = stderr_text[:400]
-                                log_parts.append(f"❌ StdErr:\n```\n{preview}\n```")
+                                log_parts.append(f"❌ StdErr:\n{fenced_code(preview)}")
                                 res_blocks.append(("❌ StdErr", _draft_clean(preview)))
                             if not log_parts:
                                 icon = "❌" if is_error else "✅"
@@ -495,15 +508,15 @@ def _chat_reader_loop(chat_id, state, record):
                                 exit_code, output = exit_match.group(1), exit_match.group(2).strip()
                                 if output:
                                     preview = output[:400]
-                                    log_parts.append(f"✅ StdOut:\n```\n{preview}\n```")
+                                    log_parts.append(f"✅ StdOut:\n{fenced_code(preview)}")
                                     res_blocks.append(("✅ StdOut", _draft_clean(preview)))
-                                log_parts.append(f"❌ StdErr:\n```\nExit code {exit_code}\n```")
+                                log_parts.append(f"❌ StdErr:\n{fenced_code(f'Exit code {exit_code}')}")
                                 res_blocks.append(("❌ StdErr", f"Exit code {exit_code}"))
                             else:
                                 icon = "❌" if is_error else "✅"
                                 label = f"{icon} {'Ошибка' if is_error else 'Результат'}"
                                 preview = result_content.strip()[:400]
-                                log_parts.append(f"{label}:\n```\n{preview}\n```")
+                                log_parts.append(f"{label}:\n{fenced_code(preview)}")
                                 res_blocks.append((label, _draft_clean(preview)))
                             ts["log_lines"].append("\n".join(log_parts))
                             ts["draft_res_blocks"] = res_blocks
@@ -595,7 +608,6 @@ def _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, 
     with chat_procs_lock:
         chat_procs[chat_id] = record
     threading.Thread(target=_chat_reader_loop, args=(chat_id, state, record), daemon=True).start()
-    threading.Thread(target=_spinner_ticker_loop, args=(chat_id, record, proc), daemon=True).start()
     return record
 
 
@@ -702,5 +714,3 @@ def _shutdown_chat_processes(*_args):
     for cid in chat_ids:
         _stop_chat_process(cid)
     sys.exit(0)
-
-

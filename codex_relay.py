@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 
-from telegram_format import escape_mdv2, strip_mdv2
+from telegram_format import escape_mdv2, fenced_code, mdv2_fenced_code, strip_mdv2
 
 
 EDIT_THROTTLE_S = 1.3
@@ -108,9 +108,9 @@ def item_label_and_blocks(item):
 
 def render_process_item(item):
     label, content, results = item_label_and_blocks(item)
-    lines = [f"{label}:", f"```\n{content}\n```"]
+    lines = [f"{label}:", fenced_code(content)]
     for result_label, result_content in results:
-        lines.extend((f"{result_label}:", f"```\n{result_content}\n```"))
+        lines.extend((f"{result_label}:", fenced_code(result_content)))
     return "\n".join(lines)
 
 
@@ -151,10 +151,21 @@ def send_rich(markdown_text):
 
 def edit_rich(message_id, markdown_text):
     text = markdown_text[:RICH_MAX_CHARS]
-    result = tg_call("editMessageText", {
+    params = {
         "chat_id": CHAT_ID, "message_id": message_id,
         "rich_message": {"markdown": text},
-    })
+    }
+    result = tg_call("editMessageText", params)
+    # Retry a transient edit limit on the same message before deliver()
+    # considers creating a fallback message; otherwise the old Thinking
+    # card and the final answer appear as two messages.
+    if _rate_limited(result):
+        retry_after = (result.get("parameters") or {}).get("retry_after")
+        try:
+            time.sleep(min(60.0, max(1.0, float(retry_after))))
+        except (TypeError, ValueError):
+            time.sleep(1.0)
+        result = tg_call("editMessageText", params)
     if not result.get("ok") and not _rate_limited(result):
         description = str(result.get("description", "")).lower()
         if "not modified" not in description:
@@ -205,21 +216,24 @@ class Relay:
             self.usage = event.get("usage")
 
     def render(self):
+        # Keep the thinking marker stable.  Editing a Braille spinner on
+        # every flush only burns Telegram's edit budget and can turn a
+        # transient rate limit into the duplicate-message path this relay
+        # is explicitly meant to avoid.
         lines = []
         if self.draft_thought:
-            lines.append(escape_mdv2(f"✍️ {self.draft_thought}"))
+            lines.append(escape_mdv2(f"🤔 {self.draft_thought}"))
         if self.draft_tool:
             label, content, results = item_label_and_blocks(self.draft_tool)
             lines.append(escape_mdv2(f"{label}:"))
             if content:
-                lines.append(f"```\n{content}\n```")
+                lines.append(mdv2_fenced_code(content))
             for result_label, result_content in results:
                 lines.extend((escape_mdv2(f"{result_label}:"),
-                              f"```\n{result_content}\n```"))
-        body = "\n".join(lines) if lines else "Думаю"
-        frame = THINKING_SPINNER_FRAMES[self.spinner_i % len(THINKING_SPINNER_FRAMES)]
-        self.spinner_i += 1
-        return f"{frame} {body}"
+                              mdv2_fenced_code(result_content)))
+        if lines:
+            return "\n".join(lines)
+        return "🤔 Думаю"
 
     def _send_or_edit_live(self, text):
         if self.message_id is None:
@@ -300,9 +314,17 @@ class Relay:
                     edit_rich(self.message_id, rich)
                 else:
                     send_rich(rich)
+                # A genuinely NEW message here is deliberate: an edit doesn't
+                # push a Telegram notification, a fresh send does. Reverted
+                # 2026-08-30 -- merging the process block and answer into one
+                # edited card (same regression fixed on the bridge/codex-bot
+                # side) silently killed the "delegated task is done"
+                # notification for every run with tool calls.
                 send_rich(answer)
             elif self.message_id is not None:
-                edit_rich(self.message_id, answer)
+                result = edit_rich(self.message_id, answer)
+                if not result or not result.get("ok"):
+                    send_rich(answer)
             else:
                 send_rich(answer)
         except Exception as exc:

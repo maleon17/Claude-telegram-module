@@ -262,6 +262,16 @@ def edit_rich(chat_id, message_id, markdown_text):
         "rich_message": {"markdown": markdown_text},
     }
     r = tg_call("editMessageText", params)
+    # A transient edit rate-limit must stay on this same message. Returning
+    # the first 429 made callers fall back to sendMessage, leaving the old
+    # live Thinking card alongside a duplicate final answer.
+    if _tg_rate_limited(r):
+        retry_after = (r.get("parameters") or {}).get("retry_after")
+        try:
+            time.sleep(min(60.0, max(1.0, float(retry_after))))
+        except (TypeError, ValueError):
+            time.sleep(1.0)
+        r = tg_call("editMessageText", params)
     if not r.get("ok"):
         if _tg_rate_limited(r):
             return r
@@ -419,5 +429,3 @@ def rich_message_to_markdown(rich_message):
     blocks = rich_message.get("blocks") or []
     parts = [_richblock_to_md(b) for b in blocks]
     return "\n\n".join(p for p in parts if p)
-
-
