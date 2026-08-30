@@ -263,9 +263,6 @@ def handle_command(chat_id, text, state, offset=None):
         return True
 
     if cmd == "login":
-        if str(chat_id) == str(OWNER_ID):
-            send_message(chat_id, "Владелец использует аккаунт по умолчанию, переподключение не нужно.")
-            return True
         start_login(chat_id, state)
         send_message(chat_id, "Начинаю переподключение аккаунта Claude...")
         return True
@@ -425,19 +422,50 @@ def answer_callback_query(callback_query_id, text=None, show_alert=False):
     tg_call("answerCallbackQuery", params)
 
 
+def _cleanup_login(chat_id, info, terminate=True):
+    """Stop one login attempt and remove only its private FIFO."""
+    if pending_logins.get(chat_id) is info:
+        pending_logins.pop(chat_id, None)
+    proc = info.get("proc") if isinstance(info, dict) else None
+    if terminate and proc is not None and proc.poll() is None:
+        proc.terminate()
+    fifo_path = info.get("fifo") if isinstance(info, dict) else None
+    if fifo_path and os.path.exists(fifo_path):
+        try:
+            os.remove(fifo_path)
+        except OSError:
+            pass
+
+
 def start_login(chat_id, state):
-    """Kick off an isolated `claude auth login` under this chat's own
-    CLAUDE_CONFIG_DIR, using the same script+FIFO pty trick used for the
-    original owner login. Runs in a background thread; the login URL is
-    sent to the user as soon as it appears in the CLI's output."""
+    """Start Claude's interactive OAuth flow and relay it through Telegram.
+
+    Non-owner chats use their isolated account directory.  The owner uses
+    the normal ``~/.claude`` directory, but the login process and its FIFO
+    live in this bridge's private runtime directory so ``/login`` works
+    remotely without requiring an SSH shell on the host.
+    """
     config_dir = account_dir(chat_id)
-    fifo_path = os.path.join(config_dir, "login_stdin.fifo")
+    login_dir = config_dir or os.path.join(os.path.dirname(__file__), "login")
+    os.makedirs(login_dir, mode=0o700, exist_ok=True)
+    fifo_path = os.path.join(login_dir, f"login_stdin_{chat_id}.fifo")
+
+    previous = pending_logins.pop(chat_id, None)
+    if previous:
+        old_proc = previous.get("proc")
+        if old_proc is not None and old_proc.poll() is None:
+            old_proc.terminate()
     if os.path.exists(fifo_path):
         os.remove(fifo_path)
     os.mkfifo(fifo_path)
 
     env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = config_dir
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    else:
+        # The service environment may have been customized.  The owner
+        # login must always target the ordinary ~/.claude account.
+        env.pop("CLAUDE_CONFIG_DIR", None)
     shell_cmd = f'exec script -qefc "{CLAUDE_BIN} auth login --claudeai" /dev/null 0<>{fifo_path}'
     proc = subprocess.Popen(
         ["bash", "-c", shell_cmd],
@@ -447,15 +475,18 @@ def start_login(chat_id, state):
         text=True,
         bufsize=1,
     )
-    pending_logins[chat_id] = {"proc": proc, "fifo": fifo_path, "config_dir": config_dir}
+    info = {"proc": proc, "fifo": fifo_path, "config_dir": config_dir}
+    pending_logins[chat_id] = info
     set_account_status(state, chat_id, "awaiting_code")
 
     def reader():
         deadline = time.time() + LOGIN_TIMEOUT_S
+        url_seen = False
         try:
             for line in proc.stdout:
                 m = re.search(r"https://\S+", line.strip())
                 if m:
+                    url_seen = True
                     send_message(
                         chat_id,
                         "1. Нажми на кнопку ниже\n"
@@ -477,6 +508,10 @@ def start_login(chat_id, state):
                     break
         except Exception:
             pass
+        if not url_seen and pending_logins.get(chat_id) is info:
+            set_account_status(state, chat_id, "login_failed")
+            _cleanup_login(chat_id, info)
+            send_message(chat_id, "❌ Не удалось запустить вход Claude. Попробуй /login ещё раз.")
 
     threading.Thread(target=reader, daemon=True).start()
 
@@ -489,6 +524,9 @@ def feed_login_code(chat_id, code, state):
         with open(info["fifo"], "w") as f:
             f.write(code.strip() + "\n")
     except Exception:
+        if pending_logins.get(chat_id) is info:
+            set_account_status(state, chat_id, "login_failed")
+            _cleanup_login(chat_id, info)
         send_message(chat_id, "Не смог передать код процессу логина. Попробуй /login заново.")
         return False
 
@@ -504,12 +542,19 @@ def feed_login_code(chat_id, code, state):
                 d = json.loads(r.stdout)
                 if d.get("loggedIn"):
                     set_account_status(state, chat_id, "ready")
-                    pending_logins.pop(chat_id, None)
+                    _cleanup_login(chat_id, info)
+                    # A persistent Claude process may have cached the expired
+                    # OAuth session.  Recreate it on the next prompt so the
+                    # fresh credentials are definitely used.
+                    _stop_chat_process(chat_id)
                     send_message(chat_id, "✅ Аккаунт подключён. Можно пользоваться ботом.")
                     return
             except Exception:
                 pass
             time.sleep(2)
+        if pending_logins.get(chat_id) is info:
+            set_account_status(state, chat_id, "login_failed")
+            _cleanup_login(chat_id, info)
         send_message(chat_id, "Не удалось подтвердить вход. Проверь код и попробуй /login ещё раз.")
 
     threading.Thread(target=check, daemon=True).start()
@@ -529,6 +574,10 @@ def handle_onboarding(chat_id, user_id, text, state, whitelist):
         return False
 
     if status == "awaiting_code":
+        if text and text.strip().lower().lstrip("/.").split()[0:1] == ["login"]:
+            start_login(chat_id, state)
+            send_message(chat_id, "Перезапускаю вход Claude — сейчас пришлю новую ссылку.")
+            return True
         if text and not text.startswith(("/", ".")):
             feed_login_code(chat_id, text.strip(), state)
         else:
@@ -560,4 +609,3 @@ def handle_callback_query(cq, state):
     elif status != "awaiting_code":
         start_login(chat_id, state)
         send_message(chat_id, "Ты в списке — начинаю подключение твоего аккаунта Claude...")
-

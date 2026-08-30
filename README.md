@@ -64,7 +64,7 @@ If you'd rather not run a script with `sudo`, do it by hand:
 | `/workspace <path>` | Change the working directory for this chat |
 | `/approve` / `/approve session` | Allow a blocked tool call once, or bypass for the rest of the session |
 | `/deny` | Reject a blocked tool call |
-| `/login` | (Non-owner accounts only) reconnect/re-authenticate your own Claude account |
+| `/login` | Start/re-authenticate the Claude account for this chat (including the owner account) |
 
 ## Multi-tenancy: giving someone else access
 
@@ -73,7 +73,7 @@ If you'd rather not run a script with `sudo`, do it by hand:
 3. Once you've added their ID, they press the button (or just message the bot again) — the bot walks them through `claude auth login` for their **own** account: it sends a login link, they authorize it and paste back the code.
 4. From then on, everything they do runs against their own Claude subscription, in `accounts/<their_chat_id>/` — fully separate sessions, usage, and billing from the owner's.
 
-The owner (whoever's Telegram ID is in `OWNER_ID`) always uses the default, un-isolated Claude account already logged in on the host — no separate login needed.
+The owner (whoever's Telegram ID is in `OWNER_ID`) uses the default, un-isolated Claude account.  If its OAuth session expires, `/login` starts the same browser flow from Telegram: open the button, authorize Claude, then send the displayed code back to the chat.  No SSH access to the host is needed.
 
 ## Permission modes
 

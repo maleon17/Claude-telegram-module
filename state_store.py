@@ -217,10 +217,20 @@ def clear_pending_prompt(state, chat_id):
 
 
 def get_account_status(state, chat_id):
-    """None (not started) / "awaiting_code" / "ready"."""
+    """None (not started) / ``awaiting_code`` / ``ready``.
+
+    The owner normally uses the default ``~/.claude`` account and therefore
+    reads as ready even before this bridge has written any state.  Once the
+    owner explicitly starts ``/login``, however, the persisted temporary
+    status must win so the next Telegram message can be consumed as the
+    OAuth code.
+    """
+    status = state.get(str(chat_id), {}).get("account_status")
+    if status:
+        return status
     if str(chat_id) == str(OWNER_ID):
         return "ready"
-    return state.get(str(chat_id), {}).get("account_status")
+    return None
 
 
 def set_account_status(state, chat_id, status):
@@ -375,4 +385,3 @@ def list_sessions(projects_dir=PROJECTS_DIR, limit=10):
             pass
         out.append((sid, mtime, preview))
     return out
-
