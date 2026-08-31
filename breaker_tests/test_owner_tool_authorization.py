@@ -46,7 +46,8 @@ def main():
     mod = load_real_claude_ask_module()
     calls, results = asyncio.run(run_tool(mod, requester_id=111))
     assert calls == [], "non-owner request reached a Telegram action"
-    assert "только владельцу" in results[0][1]
+    assert results[0][1].startswith(mod.INTERNAL_TOOL_RESULT_PREFIX)
+    assert "Действие НЕ выполнено" in results[0][1]
 
     calls, results = asyncio.run(
         run_tool(mod, requester_id=TEST_BOT_ID, chat_id=OWNER_ID)
@@ -58,7 +59,8 @@ def main():
         run_tool(mod, requester_id=TEST_BOT_ID, chat_id="456")
     )
     assert calls == [], "test channel escaped the owner's private chat"
-    assert "только владельцу" in results[0][1]
+    assert results[0][1].startswith(mod.INTERNAL_TOOL_RESULT_PREFIX)
+    assert "Действие НЕ выполнено" in results[0][1]
 
     calls, results = asyncio.run(run_tool(mod, requester_id=OWNER_ID))
     assert calls == [("block_user", "@target")]

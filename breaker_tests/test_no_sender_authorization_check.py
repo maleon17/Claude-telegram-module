@@ -54,7 +54,8 @@ def main():
 
     calls, results = asyncio.run(_run_tool(mod, requester_id=111))
     assert calls == [], "non-owner request reached a Telegram action"
-    assert "только владельцу" in results[0][1]
+    assert results[0][1].startswith(mod.INTERNAL_TOOL_RESULT_PREFIX)
+    assert "Действие НЕ выполнено" in results[0][1]
     print("[1/2] non-owner Telegram action was denied before handler execution")
 
     calls, results = asyncio.run(
