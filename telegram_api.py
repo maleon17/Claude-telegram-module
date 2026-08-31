@@ -426,6 +426,18 @@ def _richblock_to_md(block):
 
 
 def rich_message_to_markdown(rich_message):
+    if not isinstance(rich_message, dict):
+        return ""
+    # Messages sent through sendRichMessage carry the original Markdown in
+    # this field when Telegram forwards/copies them.  The structured
+    # ``blocks`` form is used by some clients, but looking only there turns a
+    # perfectly valid forwarded answer into an empty prompt.
+    for field in ("markdown", "text"):
+        value = rich_message.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
     blocks = rich_message.get("blocks") or []
+    if isinstance(blocks, dict):
+        blocks = [blocks]
     parts = [_richblock_to_md(b) for b in blocks]
     return "\n\n".join(p for p in parts if p)

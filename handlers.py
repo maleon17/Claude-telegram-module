@@ -9,7 +9,8 @@ import traceback
 
 from runtime import (
     BATCH_DEBOUNCE_S, CLAUDE_BIN, OWNER_ID, SERVICE_NAME, WORKDIR, account_dir, batch_timers,
-    busy_chats, claude_env, load_whitelist, pending_batches, pending_logins,
+    busy_chats, claude_env, load_whitelist, pending_batch_generations,
+    pending_batches, pending_batches_lock, pending_logins,
 )
 from state_store import (
     clear_session, fetch_account_limits, get_account_status, get_model,
@@ -64,6 +65,7 @@ def handle_command(chat_id, text, state, offset=None):
         # instead of picking up the cleared one. If a turn happens to be
         # active right now, this doubles as an implicit /stop -- treated
         # as reasonable given the user explicitly asked to start fresh.
+        cancel_pending_batch(chat_id)
         _stop_chat_process(chat_id)
         clear_session(state, chat_id)
         send_message(chat_id, "Начинаю новую сессию.")
@@ -73,6 +75,7 @@ def handle_command(chat_id, text, state, offset=None):
         # Real CLI slash command, sent as an ordinary prompt onto the
         # chat's persistent process -- see _chat_reader_loop's
         # "system"/"status" handling for how the result gets reported.
+        cancel_pending_batch(chat_id)
         spawn_turn(chat_id, "/compact", state)
         return True
 
@@ -115,6 +118,7 @@ def handle_command(chat_id, text, state, offset=None):
             send_message(chat_id, f"Сессия {arg} не найдена.")
             return True
         sid = os.path.basename(matches[0])[:-6]
+        cancel_pending_batch(chat_id)
         _stop_chat_process(chat_id)  # see /new -- same reason
         set_session(state, chat_id, sid)
         send_message(chat_id, f"Продолжаю сессию {sid[:8]}.")
@@ -279,6 +283,7 @@ def handle_command(chat_id, text, state, offset=None):
         # answer. Just record the request; main()'s loop performs the
         # actual restart once busy_chats is empty, so it always happens
         # between turns, never in the middle of one.
+        cancel_pending_batch(chat_id)
         request_restart(chat_id)
         if busy_chats:
             send_message(
@@ -338,45 +343,55 @@ def spawn_turn(chat_id, prompt, state, force_permission_mode=None):
 
 
 # Forwarding a batch of messages (or just typing several in quick succession)
-# used to hit busy_chats after the first one and bounce every message after
-# it with "already busy" -- one per message. Instead, collect everything
-# that arrives within a short debounce window per chat and dispatch it as a
-# single combined turn.
-def queue_prompt(chat_id, prompt, state):
-    if chat_id in busy_chats:
-        # A live process for this chat is already mid-turn -- Claude Code's
-        # own stream-json protocol natively accepts another user-message
-        # event on the SAME open stdin and merges it into the ongoing turn
-        # (see send_turn_to_chat_process's docstring -- it only ever WRITES,
-        # it never asserts the process has to be idle first). This is
-        # exactly how the owner's own mid-turn messages reached Claude all
-        # through the 2026-08-28 session, surfaced to the model as a
-        # mid-turn injection rather than a fresh turn -- no /stop needed, no
-        # reason to bounce. Skips the batch debounce below on purpose: that
-        # debounce exists to avoid spawning N separate FRESH turns for rapid
-        # typing while idle, which doesn't apply here -- there's already
-        # exactly one open turn to append to, so each message goes straight
-        # through as its own distinct injection instead of getting merged
-        # into one blob.
-        dispatch_turn(chat_id, prompt, state)
-        return
+# is one logical user turn.  Keep the same debounce while a persistent Claude
+# process is busy too: the eventual combined prompt is either a fresh turn or
+# one mid-turn stream-json injection, depending on the process state at flush
+# time.  A generation number makes cancellation safe even if an old Timer
+# wakes up after cancel() has already been called.
+def cancel_pending_batch(chat_id):
+    with pending_batches_lock:
+        timer = batch_timers.pop(chat_id, None)
+        pending_batches.pop(chat_id, None)
+        pending_batch_generations[chat_id] = pending_batch_generations.get(chat_id, 0) + 1
+    if timer:
+        timer.cancel()
 
-    pending_batches.setdefault(chat_id, []).append(prompt)
-    old_timer = batch_timers.get(chat_id)
-    if old_timer:
-        old_timer.cancel()
 
-    def fire():
+def _flush_pending_batch(chat_id, state, generation):
+    with pending_batches_lock:
+        if pending_batch_generations.get(chat_id) != generation:
+            return
         prompts = pending_batches.pop(chat_id, [])
         batch_timers.pop(chat_id, None)
-        if not prompts:
-            return
-        combined = prompts[0] if len(prompts) == 1 else "\n\n---\n\n".join(prompts)
-        spawn_turn(chat_id, combined, state)
+        pending_batch_generations.pop(chat_id, None)
 
-    timer = threading.Timer(BATCH_DEBOUNCE_S, fire)
-    timer.daemon = True
-    batch_timers[chat_id] = timer
+    if not prompts:
+        return
+    combined = prompts[0] if len(prompts) == 1 else "\n\n---\n\n".join(prompts)
+    try:
+        if chat_id in busy_chats:
+            dispatch_turn(chat_id, combined, state)
+        else:
+            spawn_turn(chat_id, combined, state)
+    except Exception:
+        err = traceback.format_exc()[-1500:]
+        print(err, flush=True)
+        send_message(chat_id, f"Ошибка моста:\n```\n{err}\n```")
+
+
+def queue_prompt(chat_id, prompt, state):
+    with pending_batches_lock:
+        pending_batches.setdefault(chat_id, []).append(prompt)
+        generation = pending_batch_generations.get(chat_id, 0) + 1
+        pending_batch_generations[chat_id] = generation
+        old_timer = batch_timers.get(chat_id)
+        timer = threading.Timer(
+            BATCH_DEBOUNCE_S, _flush_pending_batch, args=(chat_id, state, generation)
+        )
+        timer.daemon = True
+        batch_timers[chat_id] = timer
+    if old_timer:
+        old_timer.cancel()
     timer.start()
 
 

@@ -174,5 +174,6 @@ def claude_env(config_dir, chat_id=None):
 BATCH_DEBOUNCE_S = 1.5
 pending_batches = {}
 batch_timers = {}
-
+pending_batch_generations = {}
+pending_batches_lock = threading.Lock()
 

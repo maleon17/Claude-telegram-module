@@ -34,13 +34,144 @@ from chat_process import (
     _chat_proc_idle_reaper_loop, _shutdown_chat_processes, _stop_chat_process,
 )
 from handlers import (
-    handle_callback_query, handle_command, handle_onboarding, queue_prompt,
-    register_commands, spawn_turn,
+    cancel_pending_batch, handle_callback_query, handle_command, handle_onboarding,
+    queue_prompt, register_commands, spawn_turn,
 )
 from telegram_api import (
     download_telegram_file, edit_message, rich_message_to_markdown, send_message,
     tg_call, transcribe_voice,
 )
+
+
+def _is_forwarded_message(msg):
+    """Recognize both current and legacy Telegram forward fields."""
+    return bool(
+        msg.get("forward_origin")
+        or msg.get("forward_from")
+        or msg.get("forward_from_chat")
+        or msg.get("forward_sender_name")
+        or msg.get("is_automatic_forward")
+    )
+
+
+def _display_name(entity):
+    if not isinstance(entity, dict):
+        return ""
+    username = str(entity.get("username") or "").strip()
+    if username:
+        return "@" + username.lstrip("@")
+    name = " ".join(
+        str(entity.get(field) or "").strip()
+        for field in ("first_name", "last_name", "title")
+        if str(entity.get(field) or "").strip()
+    )
+    return " ".join(name.split())[:200]
+
+
+def _forwarded_source(msg):
+    origin = msg.get("forward_origin")
+    source = ""
+    if isinstance(origin, dict):
+        origin_type = origin.get("type")
+        if origin_type == "user":
+            source = _display_name(origin.get("sender_user"))
+        elif origin_type == "hidden_user":
+            source = str(origin.get("sender_user_name") or "").strip()
+        elif origin_type in ("chat", "channel"):
+            source = _display_name(origin.get("chat"))
+        if not source:
+            source = _display_name(origin.get("sender_user")) or _display_name(origin.get("chat"))
+        if not source:
+            source = str(origin.get("author_signature") or "").strip()
+
+    if not source:
+        source = _display_name(msg.get("forward_from"))
+    if not source:
+        source = _display_name(msg.get("forward_from_chat"))
+    if not source:
+        source = str(msg.get("forward_sender_name") or "").strip()
+    return " ".join(source.split())[:200]
+
+
+_MESSAGE_KIND_LABELS = (
+    ("photo", "изображение"),
+    ("document", "файл"),
+    ("voice", "голосовое сообщение"),
+    ("video", "видео"),
+    ("audio", "аудио"),
+    ("animation", "анимация/GIF"),
+    ("video_note", "видеосообщение"),
+    ("sticker", "стикер"),
+    ("contact", "контакт"),
+    ("location", "геолокация"),
+    ("venue", "место"),
+    ("poll", "опрос"),
+    ("dice", "кубик"),
+    ("game", "игра"),
+    ("story", "история"),
+    ("paid_media", "медиа"),
+    ("invoice", "счёт"),
+    ("rich_message", "rich-сообщение"),
+)
+
+
+def _message_kind_note(msg):
+    kinds = [label for key, label in _MESSAGE_KIND_LABELS if msg.get(key)]
+    if not kinds:
+        return ""
+    return "[В сообщении есть: " + ", ".join(kinds) + ".]"
+
+
+def _unsupported_message_note(msg):
+    supported = {"photo", "document", "voice", "rich_message"}
+    kinds = [
+        label for key, label in _MESSAGE_KIND_LABELS
+        if key not in supported and msg.get(key)
+    ]
+    if not kinds:
+        return ""
+    return "[В сообщении также есть: " + ", ".join(kinds) + "; этот тип вложения пока не скачивается мостом.]"
+
+
+def _message_fallback(msg):
+    note = _message_kind_note(msg)
+    if note:
+        return note
+    if _is_forwarded_message(msg):
+        return "[Пересланное сообщение без текста или поддерживаемого содержимого.]"
+    return ""
+
+
+def _build_message_prompt(msg, text, caption, voice_text, attachment_note):
+    parts = []
+    for value in (text, caption, voice_text):
+        value = str(value or "").strip()
+        if value:
+            parts.append(value)
+
+    unsupported_note = _unsupported_message_note(msg)
+    if unsupported_note and not (msg.get("rich_message") and str(text or "").strip()):
+        parts.append(unsupported_note)
+
+    attachment_note = str(attachment_note or "").strip()
+    if attachment_note:
+        parts.append(attachment_note)
+    if not parts:
+        fallback = _message_fallback(msg)
+        if fallback:
+            parts.append(fallback)
+    if not parts:
+        return ""
+
+    if _is_forwarded_message(msg):
+        source = _forwarded_source(msg)
+        header = "[Пересланное сообщение"
+        if source:
+            header += f" от {source}"
+        header += "]"
+        parts.insert(0, header)
+    return "\n\n".join(parts)
+
 
 def _restart_watcher_loop(state):
     """Runs in its own thread, checked on its own clock (every 1s) instead
@@ -217,12 +348,13 @@ def main():
                 continue
             chat_id = msg["chat"]["id"]
             user_id = msg.get("from", {}).get("id")
-            text = msg.get("text", "")
+            text = msg.get("text") or ""
             photo = msg.get("photo")
             document = msg.get("document")
             voice = msg.get("voice")
-            caption = msg.get("caption", "")
+            caption = msg.get("caption") or ""
             rich_message = msg.get("rich_message")
+            forwarded = _is_forwarded_message(msg)
 
             if rich_message and not text:
                 try:
@@ -230,11 +362,15 @@ def main():
                 except Exception:
                     print(traceback.format_exc()[-1500:], flush=True)
 
-            if not text and not photo and not document and not voice:
+            if (
+                not text and not caption and not photo and not document and not voice
+                and not rich_message and not _message_kind_note(msg) and not forwarded
+            ):
                 continue
 
             whitelist = load_whitelist()
-            if handle_onboarding(chat_id, user_id, text, state, whitelist):
+            onboarding_text = text or caption
+            if handle_onboarding(chat_id, user_id, onboarding_text, state, whitelist):
                 continue
 
             try:
@@ -244,7 +380,7 @@ def main():
                 normalized_text = text.strip().lower().lstrip("/.")
                 cmd = normalized_text.split()[0] if normalized_text else ""
 
-                if cmd == "stop" and text.startswith(("/", ".")):
+                if cmd == "stop" and text.startswith(("/", ".")) and not forwarded:
                     # Interrupting a turn now means killing the whole
                     # persistent chat process, not just "this turn" (see
                     # chat_procs) -- the reader thread's own finally-block
@@ -252,6 +388,7 @@ def main():
                     # the "⏹ Остановлено" message itself; this is just the
                     # immediate ack. Next message respawns fresh via
                     # --resume onto the same session, so nothing is lost.
+                    cancel_pending_batch(chat_id)
                     if chat_id in busy_chats:
                         _stop_chat_process(chat_id)
                         send_message(chat_id, "⏹ Прерываю текущий запрос...")
@@ -259,7 +396,7 @@ def main():
                         send_message(chat_id, "Сейчас ничего не выполняется.")
                     continue
 
-                if cmd == "approve" and text.startswith(("/", ".")):
+                if cmd == "approve" and text.startswith(("/", ".")) and not forwarded:
                     pending = get_pending_prompt(state, chat_id)
                     if not pending:
                         send_message(chat_id, "Нет заблокированного действия для approve.")
@@ -276,7 +413,7 @@ def main():
                         spawn_turn(chat_id, pending, state, force_permission_mode="bypass")
                     continue
 
-                if cmd == "deny" and text.startswith(("/", ".")):
+                if cmd == "deny" and text.startswith(("/", ".")) and not forwarded:
                     if get_pending_prompt(state, chat_id):
                         clear_pending_prompt(state, chat_id)
                         send_message(chat_id, "Отклонено.")
@@ -284,7 +421,10 @@ def main():
                         send_message(chat_id, "Нечего отклонять.")
                     continue
 
-                if not photo and not document and not voice and text.startswith(("/", ".")):
+                if (
+                    not photo and not document and not voice and text.startswith(("/", "."))
+                    and not forwarded
+                ):
                     if handle_command(chat_id, text, state, offset=offset):
                         continue
 
@@ -317,7 +457,9 @@ def main():
                     else:
                         send_message(chat_id, "Не удалось скачать голосовое сообщение.")
 
-                prompt = ((text or caption or voice_text or "").strip() + attachment_note).strip()
+                prompt = _build_message_prompt(
+                    msg, text, caption, voice_text, attachment_note,
+                )
                 if not prompt:
                     continue
 
