@@ -15,9 +15,7 @@ import os
 import sys
 import types
 
-REAL_CLAUDE_ASK_PATH = os.path.expanduser(
-    "~/.claude-telegram-bridge/jarvis-ask/claude_ask.py"
-)
+REAL_CLAUDE_ASK_PATH = "/home/mishin/claude-jarvis/claude_ask.py"
 
 
 def _install_fake_herokutl():
@@ -51,11 +49,16 @@ def _install_fake_herokutl():
         setattr(contacts, name, _make_stub(name))
 
     types_mod = types.ModuleType("herokutl.tl.types")
-    for name in ("MessageEntityUrl", "MessageEntityTextUrl", "Channel", "ChannelParticipantsAdmins"):
+    for name in (
+        "MessageEntityUrl", "MessageEntityTextUrl", "Channel",
+        "ChannelParticipantsAdmins", "Message",
+    ):
         setattr(types_mod, name, _make_stub(name))
 
     errors = types.ModuleType("herokutl.errors")
-    for name in ("UserPrivacyRestrictedError", "UserNotParticipantError"):
+    for name in (
+        "FloodWaitError", "UserPrivacyRestrictedError", "UserNotParticipantError",
+    ):
         setattr(errors, name, type(name, (Exception,), {}))
 
     sys.modules["herokutl"] = herokutl

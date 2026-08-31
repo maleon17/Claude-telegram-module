@@ -58,12 +58,16 @@ os.environ["BRIDGE_STATE_FILE"] = os.path.join(_TMP, "state.json")
 
 sys.path.insert(0, os.path.expanduser("~/.claude-telegram-bridge"))
 import bridge  # noqa: E402  (must come after the env vars above)
+import telegram_api  # noqa: E402
+from runtime import account_dir  # noqa: E402
+from state_store import get_session, get_workspace, projects_dir_for  # noqa: E402
 
 _sent = []
 bridge.tg_call = lambda method, params=None, timeout=20: (
     _sent.append((method, params)),
     {"ok": True, "result": {"message_id": 1}},
 )[1]
+telegram_api.tg_call = bridge.tg_call
 
 
 def _make_victim_session(label):
@@ -84,7 +88,7 @@ def test_absolute_path_hijack():
     handled = bridge.handle_command(attacker_chat_id, f"/resume {victim_dir}/", state)
     assert handled is True
 
-    hijacked = bridge.get_session(state, attacker_chat_id)
+    hijacked = get_session(state, attacker_chat_id)
     assert hijacked != victim_sid, f"STILL HIJACKED: expected block, got {hijacked!r}"
     assert hijacked is None, f"expected no session set, got {hijacked!r}"
     print("[1/2] absolute-path hijack blocked (no session set)")
@@ -105,9 +109,8 @@ def test_relative_traversal_hijack():
     # to model an attacker who has already sent at least one normal message,
     # which any real non-owner whitelisted user has by the time they'd
     # bother trying this.
-    pdir = bridge.projects_dir_for(bridge.account_dir(attacker_chat_id), bridge.get_workspace(state, attacker_chat_id))
+    pdir = projects_dir_for(account_dir(attacker_chat_id), get_workspace(state, attacker_chat_id))
     os.makedirs(pdir, exist_ok=True)
-    accounts_dir = bridge.ACCOUNTS_DIR
     depth = len(os.path.relpath(pdir, "/").split(os.sep))
     rel_prefix = "../" * depth
     # Pure relative traversal: walk up to "/" then back down to victim_dir
@@ -119,7 +122,7 @@ def test_relative_traversal_hijack():
     handled = bridge.handle_command(attacker_chat_id, f"/resume {payload}", state)
     assert handled is True
 
-    hijacked = bridge.get_session(state, attacker_chat_id)
+    hijacked = get_session(state, attacker_chat_id)
     assert hijacked != victim_sid, f"STILL HIJACKED: expected block, got {hijacked!r}"
     assert hijacked is None, f"expected no session set, got {hijacked!r}"
     print("[2/2] relative ../ traversal hijack blocked (no session set)")
@@ -131,9 +134,7 @@ def test_legitimate_prefix_still_works():
     must still succeed after the fix."""
     attacker_chat_id = "222000555"
     state = {}
-    pdir = bridge.projects_dir_for(
-        bridge.account_dir(attacker_chat_id), bridge.get_workspace(state, attacker_chat_id)
-    )
+    pdir = projects_dir_for(account_dir(attacker_chat_id), get_workspace(state, attacker_chat_id))
     os.makedirs(pdir, exist_ok=True)
     sid = "abcd1234-1111-2222-3333-444444444444"
     with open(os.path.join(pdir, f"{sid}.jsonl"), "w") as f:
@@ -142,7 +143,7 @@ def test_legitimate_prefix_still_works():
     handled = bridge.handle_command(attacker_chat_id, "/resume abcd1234", state)
     assert handled is True
 
-    resumed = bridge.get_session(state, attacker_chat_id)
+    resumed = get_session(state, attacker_chat_id)
     assert resumed == sid, f"legitimate prefix resume broke: expected {sid!r}, got {resumed!r}"
     print("[3/3] legitimate same-directory prefix resume still works:", resumed)
 

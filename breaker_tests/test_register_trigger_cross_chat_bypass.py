@@ -105,7 +105,7 @@ class FakeClientWithRealDialog:
         self._dialogs = [_FakeDialog(dialog_entity, is_user=False)]
 
     async def get_entity(self, _peer):
-        raise ValueError("not used in this test")
+        return self._dialogs[0].entity
 
     async def iter_dialogs(self):
         for d in self._dialogs:

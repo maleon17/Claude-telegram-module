@@ -47,7 +47,6 @@ under /tmp is still servable.
 """
 import http.client
 import os
-import re
 import threading
 import time
 import uuid
@@ -59,21 +58,12 @@ def _load_real_queue_handler():
     with open(REAL_CMD_QUEUE_PATH) as f:
         source = f.read()
 
-    # Strip only the final, unconditional server-start line (module scope,
-    # no `if __name__ == "__main__":` guard exists in the real file) so
-    # importing/exec'ing this source doesn't try to bind the real port
-    # 9092 (already held by the live service) or serve real traffic. Every
-    # other line -- the Queue class, do_GET, /download handling -- is
-    # executed completely unmodified below.
-    stripped = re.sub(
-        r'\nThreadingHTTPServer\(\("127\.0\.0\.1",\s*9092\),\s*Queue\)\.serve_forever\(\)\s*\n?$',
-        "\n",
-        source,
-    )
-    assert stripped != source, "expected to find and strip the trailing serve_forever() call"
-
+    # The real module now guards its server start with
+    # `if __name__ == "__main__":`, so executing it under a test-only module
+    # name imports the actual Queue handler without binding the live 9092
+    # port. Every line of handler logic remains the real shipped code.
     ns = {"__name__": "cmd_queue_under_test"}
-    exec(compile(stripped, REAL_CMD_QUEUE_PATH, "exec"), ns)
+    exec(compile(source, REAL_CMD_QUEUE_PATH, "exec"), ns)
     return ns["Queue"], ns["ThreadingHTTPServer"]
 
 

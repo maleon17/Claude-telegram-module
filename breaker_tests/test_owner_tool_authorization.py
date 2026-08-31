@@ -1,10 +1,5 @@
-"""Regression test for the owner-only Telegram action dispatch gate.
+"""Regression test for the owner-only Telegram action gate."""
 
-The action handlers deliberately keep their narrow business-method
-signatures. Authorization belongs at the live tool-dispatch boundary,
-where the requester's Telegram id is available and can be checked before a
-handler touches the account.
-"""
 import asyncio
 import os
 import sys
@@ -21,7 +16,7 @@ class FakeClient:
         return type("Me", (), {"id": OWNER_ID})()
 
 
-async def _run_tool(mod, requester_id):
+async def run_tool(mod, requester_id):
     instance = make_bare_instance(mod)
     instance._client = FakeClient()
     instance._owner_id_cache = None
@@ -34,33 +29,28 @@ async def _run_tool(mod, requester_id):
 
     instance._contact_action = contact_action
     instance._fetch_pending_tool_call = lambda: {
-        "request_id": "regression-request",
+        "request_id": "test-request",
         "instance_id": "andrey",
         "chat_id": "123",
         "tool": "block_user",
         "args": {"target": "@target"},
         "requester_id": requester_id,
     }
-    instance._post_tool_call_result = lambda request_id, result: results.append(
-        (request_id, result)
-    )
+    instance._post_tool_call_result = lambda request_id, result: results.append((request_id, result))
     await instance.tool_call_watcher()
     return calls, results
 
 
 def main():
     mod = load_real_claude_ask_module()
-
-    calls, results = asyncio.run(_run_tool(mod, requester_id=111))
+    calls, results = asyncio.run(run_tool(mod, requester_id=111))
     assert calls == [], "non-owner request reached a Telegram action"
     assert "только владельцу" in results[0][1]
-    print("[1/2] non-owner Telegram action was denied before handler execution")
 
-    calls, results = asyncio.run(_run_tool(mod, requester_id=OWNER_ID))
+    calls, results = asyncio.run(run_tool(mod, requester_id=OWNER_ID))
     assert calls == [("block_user", "@target")]
-    assert results == [("regression-request", "executed")]
-    print("[2/2] owner Telegram action reached the handler")
-    print("\nCLOSED: Telegram action dispatch is owner-only.")
+    assert results == [("test-request", "executed")]
+    print("CLOSED: owner-only Telegram action gate works")
 
 
 if __name__ == "__main__":
