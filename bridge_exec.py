@@ -20,11 +20,13 @@ Usage:
     bridge_exec.py [--workspace PATH] [--resume ID] [--chat-id ID]
                     [--timeout SECONDS] PROMPT...
 
-Set DELEGATOR_SESSION_ID (or CLAUDE_CODE_SESSION_ID, in case Claude ever
-calls this instead of Codex) to whatever identifies YOUR own session, if
-you want the "Session id: X / resume Y" footer -- it only appears on a
-delegated turn, never on an ordinary one (X is your session, Y is the one
-this bridge just used, to /resume this specific conversation later).
+Every call through this script is a delegated turn by definition, so the
+final answer's footer always notes it -- the OWNER's own session from
+before this call touched anything (so they can return to whatever they
+were doing) plus a `/resume` hint for the session this delegated task
+itself just used, in case they want to continue THAT specific thread
+instead. Nothing needs to be passed in for this; bridge.py's watcher
+captures the prior session itself.
 
 Prints the final answer to stdout and exits 0, or prints an error to
 stderr and exits 1 on timeout/failure.
@@ -105,9 +107,11 @@ def main():
         request["workspace"] = args.workspace
     if args.resume:
         request["resume_session_id"] = args.resume
-    delegator_session_id = os.environ.get("DELEGATOR_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if delegator_session_id:
-        request["delegator_session_id"] = delegator_session_id
+    # Every request through this file channel is a delegated one by
+    # definition (a human never writes this file) -- bridge.py's watcher
+    # captures the owner's own PRIOR session itself and shows it back in
+    # the footer ("your session, before delegation") so they can return to
+    # it; nothing needs to be passed here for that.
 
     tmp = request_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

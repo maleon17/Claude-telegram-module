@@ -79,11 +79,14 @@ def write_last_turn(chat_id, text):
 
 
 def _format_turn_footer(state, chat_id, ts):
-    """Токены on every turn; "Session id: X / resume Y" only on a
-    DELEGATED turn (X = the delegator's own session, Y = this bridge's
-    session to resume) -- per the owner directly, that pair is a
-    delegation mechanism, not a per-message one, symmetric to
-    codex-telegram-bot's identical fix in bot.py's run_turn finalize."""
+    """Токены on every turn; a delegation-only note on a turn that
+    actually came through bridge_exec.py (not a per-message thing, per
+    the owner directly), symmetric to codex-telegram-bot's identical fix
+    in bot.py's run_turn finalize. prior_session_id is the OWNER's own
+    session from before this delegated call touched anything (empty
+    string "" if there wasn't one) -- so they can return to their own
+    conversation, separate from `session_id` below, which is whatever
+    this delegated task itself ended up using."""
     parts = []
     usage = ts.get("last_usage")
     if usage:
@@ -95,12 +98,15 @@ def _format_turn_footer(state, chat_id, ts):
         if token_parts:
             parts.append(f"Токены: {', '.join(token_parts)}")
     session_id = ts.get("current_session_id")
-    delegator_session_id = get_pending_delegator(state, chat_id)
-    if delegator_session_id and session_id:
-        parts.append(
-            f"Твой session id: `{delegator_session_id[:8]}`. "
-            f"Продолжить: `/resume {session_id[:8]}`"
-        )
+    prior_session_id = get_pending_delegator(state, chat_id)
+    if prior_session_id is not None and session_id:
+        if prior_session_id:
+            parts.append(
+                f"Твой session id (до делегации): `{prior_session_id[:8]}`. "
+                f"Продолжить делегированную: `/resume {session_id[:8]}`"
+            )
+        else:
+            parts.append(f"Продолжить делегированную сессию: `/resume {session_id[:8]}`")
         set_pending_delegator(state, chat_id, None)
     return "\n\n".join(parts)
 

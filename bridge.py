@@ -27,7 +27,7 @@ from runtime import (
     chat_procs, chat_procs_lock, current_offset, load_whitelist,
 )
 from state_store import (
-    clear_pending_prompt, get_pending_prompt, load_state, pop_pending_restart,
+    clear_pending_prompt, get_pending_prompt, get_session, load_state, pop_pending_restart,
     pop_restart_request, set_pending_delegator, set_pending_restart, set_permission_mode,
     set_session, set_workspace,
 )
@@ -242,17 +242,24 @@ def _external_request_watcher_loop(state):
         text = request.get("text")
         if not text:
             continue
+        # Capture whatever session was already active for this chat BEFORE
+        # this delegated call touches anything -- shown back in the footer
+        # as "your session" so the owner can return to whatever they were
+        # doing before Codex jumped in, separate from whatever session the
+        # delegated task itself ends up using. Every request arriving
+        # through this file channel IS by definition a delegated one (a
+        # human never writes this file, only bridge_exec.py does), so no
+        # opt-in flag is needed from the caller.
+        prior_session_id = get_session(state, chat_id)
         if request.get("workspace"):
             set_workspace(state, chat_id, request["workspace"])
         if request.get("resume_session_id"):
             set_session(state, chat_id, request["resume_session_id"])
-        # Marks the NEXT completed turn as delegated so its footer carries
-        # the delegator's own session id (see chat_process.py's
-        # _format_turn_footer) -- ordinary human-typed turns never set
-        # this, so they never get that footer at all: it is a delegation
-        # mechanism, not a per-message one, per the owner directly.
-        if request.get("delegator_session_id"):
-            set_pending_delegator(state, chat_id, request["delegator_session_id"])
+        # "" (not None) marks this turn as delegated with no prior session
+        # to offer back; None means "not delegated" (an ordinary Telegram
+        # turn never touches this field). See chat_process.py's
+        # _format_turn_footer.
+        set_pending_delegator(state, chat_id, prior_session_id or "")
         queue_prompt(chat_id, text, state)
 
 
