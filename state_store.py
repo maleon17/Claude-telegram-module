@@ -10,6 +10,15 @@ from runtime import (
 )
 from telegram_api import send_message
 
+
+DELEGATE_KEY_PREFIX = "delegate:"
+
+
+def delegate_key(chat_id):
+    """Return the stable bookkeeping key for a delegated process."""
+    return f"{DELEGATE_KEY_PREFIX}{chat_id}"
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -72,7 +81,7 @@ def _empty_usage():
     }
 
 
-def add_usage(state, chat_id, session_id, result_event):
+def add_usage(state, chat_id, session_id, result_event, notify_chat_id=None):
     if not session_id:
         return
     prev_cost = new_cost = baseline = None
@@ -136,7 +145,7 @@ def add_usage(state, chat_id, session_id, result_event):
     # since the last compaction, without a separate "already warned" flag.
     if new_cost is not None and prev_cost - baseline < COST_WARNING_USD <= new_cost - baseline:
         send_message(
-            chat_id,
+            chat_id if notify_chat_id is None else notify_chat_id,
             f"⚠️ Стоимость этой сессии по API-эквиваленту выросла ещё на "
             f"${COST_WARNING_USD:.0f} (всего ~${new_cost:.2f}). "
             f"Есть смысл сделать /compact или начать заново через /new.",

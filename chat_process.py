@@ -9,7 +9,7 @@ import traceback
 
 from runtime import (
     CHAT_PROC_IDLE_TIMEOUT_S, CLAUDE_BIN, EDIT_THROTTLE_S, STATE_FILE,
-    THINKING_SPINNER_FRAMES, WORKDIR, busy_chats, chat_procs,
+    STATE_INSTANCE_NAME, THINKING_SPINNER_FRAMES, WORKDIR, busy_chats, chat_procs,
     chat_procs_lock, claude_env,
 )
 from state_store import (
@@ -63,13 +63,16 @@ def _draft_clean(s, limit=200):
     return re.sub(r"\s+", " ", s).strip()[:limit]
 
 
-def write_last_turn(chat_id, text):
+def write_last_turn(chat_id, text, delegated=False):
     """Signal a completed turn's final text via a plain file instead of
     Telegram's getUpdates -- this process already owns that bot token's
     getUpdates stream exclusively (only one consumer can ever see a given
     update), so an external script polling the same API would just starve.
     bridge_exec.py polls this file instead."""
-    path = os.path.join(os.path.dirname(STATE_FILE), f"last_turn_{chat_id}.json")
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(STATE_FILE)),
+        f"last_turn_{STATE_INSTANCE_NAME}{'_delegate' if delegated else ''}_{chat_id}.json",
+    )
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -79,7 +82,7 @@ def write_last_turn(chat_id, text):
         pass
 
 
-def _format_turn_footer(state, chat_id, ts):
+def _format_turn_footer(state, chat_id, ts, preserve_current_session=False):
     """Токены on every turn; a delegation-only note on a turn that
     actually came through bridge_exec.py (not a per-message thing, per
     the owner directly), symmetric to codex-telegram-bot's identical fix
@@ -109,13 +112,17 @@ def _format_turn_footer(state, chat_id, ts):
         else:
             parts.append(f"Продолжить делегированную сессию: `/resume {session_id[:8]}`")
         set_pending_delegator(state, chat_id, None)
-        # The delegated session is live only for this one turn -- restore
-        # the owner's own pre-delegation session right away (mirrors the
-        # identical fix in codex-telegram-bot's bot.py run_turn finalize)
-        # so their next ordinary Telegram message continues their own
-        # conversation, not the delegated one. `/resume <id>` above still
-        # works to explicitly continue the delegated session instead.
-        set_session(state, chat_id, prior_session_id or None)
+        # For ordinary owner turns, restore the owner's own pre-delegation
+        # session right away (the existing fix mirrored in
+        # codex-telegram-bot's bot.py run_turn finalize), so the next message
+        # cannot accidentally continue a delegated session. A delegate has a
+        # separate state entry, so preserve_current_session keeps that entry
+        # on its own session while the owner entry remains untouched.
+        set_session(
+            state,
+            chat_id,
+            ts["current_session_id"] if preserve_current_session else prior_session_id or None,
+        )
     return "\n\n".join(parts)
 
 
@@ -227,13 +234,16 @@ def _compact_draft_watchdog(chat_id, ts):
             return
 
 
-def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
+def _deliver_turn_result(
+    chat_id, state, ts, prompt, proc, stopped=False, output_chat_id=None, delegated=False,
+):
     """Everything that used to happen after run_claude() returned, plus
     dispatch_turn()'s own tail (attachments, denial handling) -- merged
     here because in the persistent-process model EVERY turn, whether we
     explicitly wrote it to stdin or it's a spontaneous reply to a
     background task finishing on its own, is delivered from
     _chat_reader_loop, not from whoever originally called dispatch_turn."""
+    telegram_chat_id = chat_id if output_chat_id is None else output_chat_id
     log_lines = ts["log_lines"]
     final_text = ts["final_text"]
 
@@ -304,17 +314,20 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
             # sending a separate new message -- one fewer message in the
             # chat, and the transition reads as "this IS what it was
             # building the whole time" rather than a swap.
-            edit_rich(chat_id, ts["progress_msg_id"], process_rich_text)
+            edit_rich(telegram_chat_id, ts["progress_msg_id"], process_rich_text)
             progress_became_process_block = True
         else:
-            send_rich(chat_id, process_rich_text)
+            send_rich(telegram_chat_id, process_rich_text)
 
     final_payload = text_out or "(пусто)"
     if not stopped:
-        footer = _format_turn_footer(state, chat_id, ts)
+        footer = _format_turn_footer(
+            state, chat_id, ts, preserve_current_session=delegated,
+        )
         if footer:
             final_payload = f"{final_payload}\n\n{footer}"
-        write_last_turn(chat_id, final_payload)
+    if not stopped or delegated:
+        write_last_turn(telegram_chat_id, final_payload, delegated=delegated)
     if ts["progress_msg_id"] is not None and not progress_became_process_block:
         # Either there was no tool-call content at all (a plain
         # conversational turn), or there was but it already got absorbed
@@ -324,7 +337,7 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
         # message (caught live 2026-08-28: that delete+resend was visibly
         # flickering -- the answer would flash as the progress message,
         # vanish, then reappear as a "new" one a beat later).
-        edit_rich(chat_id, ts["progress_msg_id"], final_payload)
+        edit_rich(telegram_chat_id, ts["progress_msg_id"], final_payload)
     else:
         # A genuinely NEW message here is deliberate, not incidental: an
         # edit does not push a Telegram notification, a fresh sendMessage
@@ -333,7 +346,7 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
         # message, which silently killed the "your answer is ready"
         # notification for every tool-using turn (the user only ever got
         # pinged by the initial "🤔 Думаю" placeholder, then nothing).
-        send_rich(chat_id, final_payload)
+        send_rich(telegram_chat_id, final_payload)
 
     if not stopped:
         attachments = list(ts["written_files"])
@@ -342,7 +355,7 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
                 attachments.append(p)
         for path in attachments:
             if os.path.isfile(path):
-                send_attachment(chat_id, path)
+                send_attachment(telegram_chat_id, path)
 
     if ts["denials"] and prompt:
         set_pending_prompt(state, chat_id, prompt)
@@ -353,7 +366,7 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
         lines.append("/approve — повторить один раз с bypass")
         lines.append("/approve session — включить bypass насовсем для этой сессии")
         lines.append("/deny — оставить как есть")
-        send_message(chat_id, "\n".join(lines))
+        send_message(telegram_chat_id, "\n".join(lines))
     else:
         clear_pending_prompt(state, chat_id)
 
@@ -369,6 +382,7 @@ def _spinner_ticker_loop(chat_id, record, proc):
     process's lifetime, same idea as _chat_proc_idle_reaper_loop -- exits
     as soon as this process is no longer the live one for chat_id (respawned,
     stopped, or the chat itself is idle) rather than running forever."""
+    telegram_chat_id = record.get("telegram_chat_id", chat_id)
     while True:
         time.sleep(1.5)
         with chat_procs_lock:
@@ -381,7 +395,7 @@ def _spinner_ticker_loop(chat_id, record, proc):
         ts = record.get("ts")
         if ts is not None and ts.get("progress_msg_id") is not None:
             try:
-                _flush_draft(chat_id, ts, force=True)
+                _flush_draft(telegram_chat_id, ts, force=True)
             except Exception:
                 pass
 
@@ -398,6 +412,7 @@ def _chat_reader_loop(chat_id, state, record):
     needed, which is what makes the old WAKEUP_SIGNAL_DIR workaround
     obsolete for chats running under this model)."""
     proc = record["proc"]
+    telegram_chat_id = record.get("telegram_chat_id", chat_id)
     ts = _new_turn_accumulator(state, chat_id)
     record["ts"] = ts  # see _spinner_ticker_loop -- needs the CURRENT ts
 
@@ -452,7 +467,7 @@ def _chat_reader_loop(chat_id, state, record):
                     ts["draft_cmd_label"] = None
                     ts["draft_cmd"] = None
                     ts["draft_res_blocks"] = []
-                    _flush_draft(chat_id, ts, force=True)
+                    _flush_draft(telegram_chat_id, ts, force=True)
                     # Real compaction on a large session takes MINUTES
                     # (measured ~5 min on a ~400K-token session, 2026-08-24)
                     # with zero intermediate stream events -- nothing else
@@ -465,7 +480,7 @@ def _chat_reader_loop(chat_id, state, record):
                     ts["compact_done_event"] = threading.Event()
                     threading.Thread(
                         target=_compact_draft_watchdog,
-                        args=(chat_id, ts),
+                        args=(telegram_chat_id, ts),
                         daemon=True,
                     ).start()
                 elif "compact_result" in d:
@@ -482,7 +497,7 @@ def _chat_reader_loop(chat_id, state, record):
             if t == "stream_event":
                 ev = d.get("event", {})
                 if ev.get("type") == "content_block_delta":
-                    _flush_draft(chat_id, ts)
+                    _flush_draft(telegram_chat_id, ts)
                 continue
 
             if t == "assistant":
@@ -501,7 +516,7 @@ def _chat_reader_loop(chat_id, state, record):
                         ts["draft_cmd_label"] = label
                         ts["draft_cmd"] = _draft_clean(content_)
                         ts["draft_res_blocks"] = []
-                        _flush_draft(chat_id, ts, force=True)
+                        _flush_draft(telegram_chat_id, ts, force=True)
                         if name == "Write":
                             fp = tool_input.get("file_path")
                             if fp and not os.path.abspath(os.path.expanduser(fp)).startswith(
@@ -519,8 +534,8 @@ def _chat_reader_loop(chat_id, state, record):
                             ts["draft_cmd_label"] = None
                             ts["draft_cmd"] = None
                             ts["draft_res_blocks"] = []
-                            _flush_draft(chat_id, ts, force=True)
-                _flush_draft(chat_id, ts)
+                            _flush_draft(telegram_chat_id, ts, force=True)
+                _flush_draft(telegram_chat_id, ts)
                 continue
 
             if t == "user":
@@ -583,7 +598,7 @@ def _chat_reader_loop(chat_id, state, record):
                                 res_blocks.append((label, _draft_clean(preview)))
                             ts["log_lines"].append("\n".join(log_parts))
                             ts["draft_res_blocks"] = res_blocks
-                        _flush_draft(chat_id, ts, force=True)
+                        _flush_draft(telegram_chat_id, ts, force=True)
                 continue
 
             if t == "result":
@@ -591,12 +606,27 @@ def _chat_reader_loop(chat_id, state, record):
                 ts["final_text"] = d.get("result", "")
                 ts["last_usage"] = d.get("usage") or {}
                 ts["denials"].extend(d.get("permission_denials") or [])
-                add_usage(state, chat_id, ts["current_session_id"], d)
+                add_usage(
+                    state,
+                    chat_id,
+                    ts["current_session_id"],
+                    d,
+                    notify_chat_id=telegram_chat_id,
+                )
                 with record["write_lock"]:
                     prompt = record["original_prompt"]
                     record["original_prompt"] = None
                 try:
-                    _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False)
+                    _deliver_turn_result(
+                        chat_id,
+                        state,
+                        ts,
+                        prompt,
+                        proc,
+                        stopped=False,
+                        output_chat_id=telegram_chat_id,
+                        delegated=record.get("delegated", False),
+                    )
                 except Exception:
                     print(traceback.format_exc()[-1500:], flush=True)
                 with chat_procs_lock:
@@ -619,7 +649,16 @@ def _chat_reader_loop(chat_id, state, record):
             # (e.g. the idle reaper stopped a genuinely idle process),
             # there's nothing to report.
             try:
-                _deliver_turn_result(chat_id, state, ts, original_prompt, proc, stopped=True)
+                _deliver_turn_result(
+                    chat_id,
+                    state,
+                    ts,
+                    original_prompt,
+                    proc,
+                    stopped=True,
+                    output_chat_id=telegram_chat_id,
+                    delegated=record.get("delegated", False),
+                )
             except Exception:
                 print(traceback.format_exc()[-1500:], flush=True)
         with chat_procs_lock:
@@ -634,7 +673,11 @@ def _chat_process_signature(model, permission_mode, workspace, config_dir):
     return (model, permission_mode, workspace, config_dir)
 
 
-def _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, session_id, state):
+def _start_chat_process(
+    chat_id, model, permission_mode, workspace, config_dir, session_id, state,
+    output_chat_id=None, delegated=False,
+):
+    telegram_chat_id = chat_id if output_chat_id is None else output_chat_id
     args = [
         CLAUDE_BIN,
         "-p",
@@ -655,7 +698,7 @@ def _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, 
     proc = subprocess.Popen(
         args,
         cwd=workspace or WORKDIR,
-        env=claude_env(config_dir, chat_id),
+        env=claude_env(config_dir, telegram_chat_id),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -668,6 +711,8 @@ def _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, 
         "last_activity": time.time(),
         "original_prompt": None,
         "write_lock": threading.Lock(),
+        "telegram_chat_id": telegram_chat_id,
+        "delegated": delegated,
     }
     with chat_procs_lock:
         chat_procs[chat_id] = record
@@ -698,7 +743,10 @@ def _stop_chat_process(chat_id):
         pass
 
 
-def _ensure_chat_process(chat_id, model, permission_mode, workspace, config_dir, state):
+def _ensure_chat_process(
+    chat_id, model, permission_mode, workspace, config_dir, state,
+    output_chat_id=None, delegated=False,
+):
     """Returns a live process record for chat_id, starting or restarting
     one if needed. A restart is needed if there's no process yet, the
     previous one died, or /model, /mode, or /workspace changed since it
@@ -713,11 +761,22 @@ def _ensure_chat_process(chat_id, model, permission_mode, workspace, config_dir,
     if record:
         _stop_chat_process(chat_id)
     session_id = get_session(state, chat_id)
-    return _start_chat_process(chat_id, model, permission_mode, workspace, config_dir, session_id, state)
+    return _start_chat_process(
+        chat_id,
+        model,
+        permission_mode,
+        workspace,
+        config_dir,
+        session_id,
+        state,
+        output_chat_id=output_chat_id,
+        delegated=delegated,
+    )
 
 
 def send_turn_to_chat_process(
     chat_id, prompt, state, model=None, permission_mode=None, workspace=None, config_dir=None,
+    output_chat_id=None, delegated=False,
 ):
     """Non-blocking: ensures chat_id's persistent process is up (spawning
     or respawning it if needed) and writes `prompt` onto its stdin as one
@@ -730,7 +789,16 @@ def send_turn_to_chat_process(
     (current default, unchanged). Any other value -> --permission-mode <mode>,
     which can produce real permission_denials in the result event.
     """
-    record = _ensure_chat_process(chat_id, model, permission_mode, workspace, config_dir, state)
+    record = _ensure_chat_process(
+        chat_id,
+        model,
+        permission_mode,
+        workspace,
+        config_dir,
+        state,
+        output_chat_id=output_chat_id,
+        delegated=delegated,
+    )
     msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}
     with record["write_lock"]:
         # Mid-turn user messages are injected into the live turn too, but

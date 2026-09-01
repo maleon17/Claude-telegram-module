@@ -22,6 +22,7 @@ STATE_FILE = os.environ.get(
     "BRIDGE_STATE_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"),
 )
+STATE_INSTANCE_NAME = os.path.splitext(os.path.basename(STATE_FILE))[0]
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
 SERVICE_NAME = os.environ.get("SERVICE_NAME")  # this instance's own systemd unit, for /restart
 PROJECTS_DIR = os.path.join(
@@ -106,7 +107,10 @@ WHITELIST_FILE = os.path.join(
 RESTART_SIGNAL_FILE = STATE_FILE + ".restart_signal"
 EXTERNAL_REQUEST_FILE = os.environ.get(
     "BRIDGE_EXTERNAL_REQUEST_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(STATE_FILE)), "external_request.json"),
+    os.path.join(
+        os.path.dirname(os.path.abspath(STATE_FILE)),
+        f"external_request_{STATE_INSTANCE_NAME}.json",
+    ),
 )
 ACCOUNTS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)), "accounts"
@@ -180,4 +184,3 @@ pending_batches = {}
 batch_timers = {}
 pending_batch_generations = {}
 pending_batches_lock = threading.Lock()
-

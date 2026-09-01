@@ -27,16 +27,16 @@ from runtime import (
     chat_procs, chat_procs_lock, current_offset, load_whitelist,
 )
 from state_store import (
-    clear_pending_prompt, get_pending_prompt, get_session, load_state, pop_pending_restart,
-    pop_restart_request, set_pending_delegator, set_pending_restart, set_permission_mode,
-    set_session, set_workspace,
+    clear_pending_prompt, get_pending_prompt, load_state, pop_pending_restart,
+    pop_restart_request, set_pending_restart, set_permission_mode,
 )
 from chat_process import (
     _chat_proc_idle_reaper_loop, _shutdown_chat_processes, _stop_chat_process,
 )
 from handlers import (
     cancel_pending_batch, handle_callback_query, handle_command, handle_onboarding,
-    queue_prompt, register_commands, spawn_turn,
+    process_key_for_command, process_key_for_incoming, register_commands, route_prompt,
+    spawn_turn, start_delegate_turn,
 )
 from telegram_api import (
     download_telegram_file, edit_message, rich_message_to_markdown, send_message,
@@ -218,10 +218,10 @@ def _external_request_watcher_loop(state):
     either. Since this bridge is our own code, the fix is to skip Telegram
     for this leg entirely: bridge_exec.py (Codex's copy, delegating TO
     Claude) writes a request file here instead of pretending to be an
-    incoming message, and this feeds it straight into queue_prompt() --
-    the exact same entry point a real incoming Telegram message reaches.
-    Real human steering via Telegram is untouched; this is a second,
-    independent input path into the same live turn, not a replacement."""
+    incoming message. The request gets its own persistent delegate process;
+    it is not allowed to reuse or steer the owner's process by default.
+    Real human steering via Telegram is routed to that delegate process while
+    it is busy, and otherwise continues to use the owner's process."""
     while True:
         time.sleep(1)
         if not os.path.exists(EXTERNAL_REQUEST_FILE):
@@ -242,25 +242,13 @@ def _external_request_watcher_loop(state):
         text = request.get("text")
         if not text:
             continue
-        # Capture whatever session was already active for this chat BEFORE
-        # this delegated call touches anything -- shown back in the footer
-        # as "your session" so the owner can return to whatever they were
-        # doing before Codex jumped in, separate from whatever session the
-        # delegated task itself ends up using. Every request arriving
-        # through this file channel IS by definition a delegated one (a
-        # human never writes this file, only bridge_exec.py does), so no
-        # opt-in flag is needed from the caller.
-        prior_session_id = get_session(state, chat_id)
-        if request.get("workspace"):
-            set_workspace(state, chat_id, request["workspace"])
-        if request.get("resume_session_id"):
-            set_session(state, chat_id, request["resume_session_id"])
-        # "" (not None) marks this turn as delegated with no prior session
-        # to offer back; None means "not delegated" (an ordinary Telegram
-        # turn never touches this field). See chat_process.py's
-        # _format_turn_footer.
-        set_pending_delegator(state, chat_id, prior_session_id or "")
-        queue_prompt(chat_id, text, state)
+        start_delegate_turn(
+            chat_id,
+            text,
+            state,
+            resume_session_id=request.get("resume_session_id"),
+            workspace=request.get("workspace"),
+        )
 
 
 def _pop_wakeup_signals():
@@ -444,34 +432,50 @@ def main():
                     # the "⏹ Остановлено" message itself; this is just the
                     # immediate ack. Next message respawns fresh via
                     # --resume onto the same session, so nothing is lost.
-                    cancel_pending_batch(chat_id)
-                    if chat_id in busy_chats:
-                        _stop_chat_process(chat_id)
+                    target_key = process_key_for_incoming(chat_id)
+                    cancel_pending_batch(target_key)
+                    if target_key in busy_chats:
+                        _stop_chat_process(target_key)
                         send_message(chat_id, "⏹ Прерываю текущий запрос...")
                     else:
                         send_message(chat_id, "Сейчас ничего не выполняется.")
                     continue
 
                 if cmd == "approve" and text.startswith(("/", ".")) and not forwarded:
-                    pending = get_pending_prompt(state, chat_id)
+                    target_key = process_key_for_command(chat_id, state)
+                    pending = get_pending_prompt(state, target_key)
                     if not pending:
                         send_message(chat_id, "Нет заблокированного действия для approve.")
                         continue
                     arg = text.partition(" ")[2].strip().lower()
                     if arg == "session":
-                        set_permission_mode(state, chat_id, "bypass")
+                        set_permission_mode(state, target_key, "bypass")
                         send_message(chat_id, "Bypass включён для этой сессии насовсем. Повторяю...")
-                        clear_pending_prompt(state, chat_id)
-                        spawn_turn(chat_id, pending, state)
+                        clear_pending_prompt(state, target_key)
+                        spawn_turn(
+                            target_key,
+                            pending,
+                            state,
+                            output_chat_id=chat_id if target_key != chat_id else None,
+                            delegated=target_key != chat_id,
+                        )
                     else:
                         send_message(chat_id, "Разрешаю один раз. Повторяю...")
-                        clear_pending_prompt(state, chat_id)
-                        spawn_turn(chat_id, pending, state, force_permission_mode="bypass")
+                        clear_pending_prompt(state, target_key)
+                        spawn_turn(
+                            target_key,
+                            pending,
+                            state,
+                            force_permission_mode="bypass",
+                            output_chat_id=chat_id if target_key != chat_id else None,
+                            delegated=target_key != chat_id,
+                        )
                     continue
 
                 if cmd == "deny" and text.startswith(("/", ".")) and not forwarded:
-                    if get_pending_prompt(state, chat_id):
-                        clear_pending_prompt(state, chat_id)
+                    target_key = process_key_for_command(chat_id, state)
+                    if get_pending_prompt(state, target_key):
+                        clear_pending_prompt(state, target_key)
                         send_message(chat_id, "Отклонено.")
                     else:
                         send_message(chat_id, "Нечего отклонять.")
@@ -519,7 +523,7 @@ def main():
                 if not prompt:
                     continue
 
-                queue_prompt(chat_id, prompt, state)
+                route_prompt(chat_id, prompt, state)
             except Exception:
                 err = traceback.format_exc()[-1500:]
                 print(err, flush=True)

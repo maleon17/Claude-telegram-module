@@ -9,12 +9,11 @@ simply does not deliver them back to the sender, confirmed live
 can inject into a private 1:1 chat either -- it only ever has its two real
 participants). Since bridge.py is our own code, the real fix is to skip
 Telegram for this leg entirely: this script writes a request file that
-bridge.py's _external_request_watcher_loop() polls and feeds straight into
-queue_prompt() -- the exact same entry point a real incoming Telegram
-message reaches. Real formatting, real /resume, real mid-turn steering
-(the owner typing into the same chat while this runs still gets genuinely
-steered in) all come from the actual product for free -- only the INPUT
-side bypasses Telegram now.
+bridge.py's _external_request_watcher_loop() polls and dispatches into the
+dedicated persistent delegate slot. Real formatting, real /resume, and real
+mid-turn steering (the owner typing into the same chat while this runs still
+gets genuinely steered into that delegate process) all come from the actual
+product for free -- only the INPUT side bypasses Telegram now.
 
 Usage:
     bridge_exec.py [--workspace PATH] [--resume ID] [--chat-id ID]
@@ -39,21 +38,34 @@ import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OWNER_ID = 8480261623
+PRIMARY_STATE_FILE = os.path.join(ROOT, "state.json")
+PRIMARY_STATE_INSTANCE_NAME = os.path.splitext(
+    os.path.basename(PRIMARY_STATE_FILE)
+)[0]
+PRIMARY_EXTERNAL_REQUEST_FILE = os.path.join(
+    ROOT, f"external_request_{PRIMARY_STATE_INSTANCE_NAME}.json"
+)
 
 
 def external_request_path():
     return os.environ.get(
-        "BRIDGE_EXTERNAL_REQUEST_FILE", os.path.join(ROOT, "external_request.json"),
+        "BRIDGE_EXEC_EXTERNAL_REQUEST_FILE", PRIMARY_EXTERNAL_REQUEST_FILE,
     )
 
 
-def last_turn_path(chat_id):
+def last_turn_path(chat_id, delegated=False):
     # Mirrors chat_process.py's write_last_turn():
-    # os.path.join(os.path.dirname(STATE_FILE), f"last_turn_{chat_id}.json").
+    # os.path.join(os.path.dirname(STATE_FILE),
+    #              f"last_turn_{STATE_INSTANCE_NAME}{'_delegate' if delegated else ''}_{chat_id}.json").
     state_file = os.environ.get(
-        "BRIDGE_STATE_FILE", os.path.join(ROOT, "state.json"),
+        "BRIDGE_EXEC_STATE_FILE", PRIMARY_STATE_FILE,
     )
-    return os.path.join(os.path.dirname(state_file), f"last_turn_{chat_id}.json")
+    state_instance_name = os.path.splitext(os.path.basename(state_file))[0]
+    signal_suffix = "_delegate" if delegated else ""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(state_file)),
+        f"last_turn_{state_instance_name}{signal_suffix}_{chat_id}.json",
+    )
 
 
 def poll_until_done(chat_id, baseline_ts, timeout_s, poll_interval=2):
@@ -62,7 +74,7 @@ def poll_until_done(chat_id, baseline_ts, timeout_s, poll_interval=2):
     that bot token's getUpdates stream exclusively (only one consumer ever
     sees a given update), so a second independent poller there would just
     starve forever. See chat_process.py's write_last_turn()."""
-    path = last_turn_path(chat_id)
+    path = last_turn_path(chat_id, delegated=True)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
@@ -97,7 +109,7 @@ def main():
     # Baseline BEFORE writing the request -- only a last_turn file written
     # strictly after this counts as ours, not a stale prior turn's.
     try:
-        with open(last_turn_path(chat_id), encoding="utf-8") as f:
+        with open(last_turn_path(chat_id, delegated=True), encoding="utf-8") as f:
             baseline_ts = json.load(f).get("ts", 0)
     except (FileNotFoundError, json.JSONDecodeError):
         baseline_ts = 0

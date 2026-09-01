@@ -13,12 +13,13 @@ from runtime import (
     pending_batches, pending_batches_lock, pending_logins,
 )
 from state_store import (
-    clear_session, fetch_account_limits, get_account_status, get_model,
-    get_permission_mode, get_session, get_usage, get_workspace, list_sessions,
-    projects_dir_for, request_restart, session_message_count, set_account_status,
-    set_model, set_permission_mode, set_session, set_workspace,
+    clear_pending_prompt, clear_session, delegate_key, fetch_account_limits,
+    get_account_status, get_model, get_pending_prompt, get_permission_mode,
+    get_session, get_usage, get_workspace, list_sessions, projects_dir_for,
+    request_restart, session_message_count, set_account_status, set_model,
+    set_pending_delegator, set_permission_mode, set_session, set_workspace,
 )
-from chat_process import _stop_chat_process, send_turn_to_chat_process
+from chat_process import _stop_chat_process, send_turn_to_chat_process, write_last_turn
 from telegram_api import send_message, send_typing, tg_call
 from telegram_format import format_message
 
@@ -31,6 +32,27 @@ MODEL_VERSIONS = {
 MODEL_ALIASES = tuple(MODEL_VERSIONS.keys())
 
 PERMISSION_MODES = ("bypass", "default", "acceptEdits", "plan")
+
+pending_batch_output_chats = {}
+
+
+def process_key_for_incoming(chat_id):
+    """Route a real Telegram message to a busy delegated process, if any."""
+    delegate_process = delegate_key(chat_id)
+    return delegate_process if delegate_process in busy_chats else chat_id
+
+
+def process_key_for_command(chat_id, state):
+    """Like process_key_for_incoming, also preserve delegated denial state."""
+    delegate_process = delegate_key(chat_id)
+    if delegate_process in busy_chats or get_pending_prompt(state, delegate_process):
+        return delegate_process
+    return chat_id
+
+
+def _delegate_error(chat_id, text):
+    send_message(chat_id, text)
+    write_last_turn(chat_id, text, delegated=True)
 
 COMMANDS = [
     ("new", "Начать новую сессию"),
@@ -340,7 +362,9 @@ def register_commands():
     tg_call("setMyCommands", {**payload, "scope": {"type": "all_private_chats"}})
 
 
-def _run_turn_thread(chat_id, prompt, state, force_permission_mode=None):
+def _run_turn_thread(
+    chat_id, prompt, state, force_permission_mode=None, output_chat_id=None, delegated=False,
+):
     """dispatch_turn() now only ensures the chat's persistent process and
     writes the prompt to its stdin -- it returns almost immediately, long
     before the turn is actually done. So busy_chats is only cleared HERE
@@ -349,27 +373,108 @@ def _run_turn_thread(chat_id, prompt, state, force_permission_mode=None):
     clearing it is _chat_reader_loop's job once it sees this turn's
     "result" event (or the process dying mid-turn)."""
     try:
-        dispatch_turn(chat_id, prompt, state, force_permission_mode=force_permission_mode)
+        dispatch_turn(
+            chat_id,
+            prompt,
+            state,
+            force_permission_mode=force_permission_mode,
+            output_chat_id=output_chat_id,
+            delegated=delegated,
+        )
     except Exception:
         err = traceback.format_exc()[-1500:]
         print(err, flush=True)
-        send_message(chat_id, f"Ошибка моста:\n```\n{err}\n```")
+        error_text = f"Ошибка моста:\n```\n{err}\n```"
+        send_message(output_chat_id or chat_id, error_text)
+        if delegated:
+            write_last_turn(output_chat_id or chat_id, error_text, delegated=True)
         busy_chats.discard(chat_id)
 
 
-def spawn_turn(chat_id, prompt, state, force_permission_mode=None):
+def spawn_turn(
+    chat_id, prompt, state, force_permission_mode=None, output_chat_id=None, delegated=False,
+):
     """Run a turn in the background so the poll loop stays responsive to
     /stop and other commands while `claude` is running."""
     if chat_id in busy_chats:
-        send_message(chat_id, "Уже выполняю предыдущий запрос. Дождись ответа или используй /stop.")
+        send_message(
+            output_chat_id or chat_id,
+            "Уже выполняю предыдущий запрос. Дождись ответа или используй /stop.",
+        )
         return
     busy_chats.add(chat_id)
     threading.Thread(
         target=_run_turn_thread,
         args=(chat_id, prompt, state),
-        kwargs={"force_permission_mode": force_permission_mode},
+        kwargs={
+            "force_permission_mode": force_permission_mode,
+            "output_chat_id": output_chat_id,
+            "delegated": delegated,
+        },
         daemon=True,
     ).start()
+
+
+def start_delegate_turn(chat_id, prompt, state, resume_session_id=None, workspace=None):
+    """Start one isolated, persistent turn for bridge_exec.py.
+
+    The delegate has its own bookkeeping key and Claude process, while all
+    Telegram output is still addressed to the real owner chat. A missing
+    resume id deliberately tears down any idle delegate process and clears
+    its session so every default delegation starts a fresh conversation.
+    """
+    delegate_process = delegate_key(chat_id)
+    requested_session_id = str(resume_session_id or "").strip() or None
+
+    if delegate_process in busy_chats:
+        _delegate_error(chat_id, "Уже выполняю предыдущую делегированную задачу.")
+        return False
+
+    cancel_pending_batch(delegate_process)
+    owner_session_id = get_session(state, chat_id)
+    delegate_session_id = get_session(state, delegate_process)
+
+    if requested_session_id:
+        is_matching_delegate = bool(
+            delegate_session_id
+            and (
+                delegate_session_id == requested_session_id
+                or delegate_session_id.startswith(requested_session_id)
+            )
+        )
+        if not is_matching_delegate or (
+            owner_session_id and delegate_session_id == owner_session_id
+        ):
+            _delegate_error(
+                chat_id,
+                "Нельзя продолжить эту делегацию: resume_session_id не совпадает "
+                "с последней сессией делегатора.",
+            )
+            return False
+        if workspace:
+            set_workspace(state, delegate_process, workspace)
+    else:
+        # A default delegation is always fresh. Stop only the idle delegate
+        # slot; the owner's independent process is never touched here.
+        _stop_chat_process(delegate_process)
+        clear_session(state, delegate_process)
+        clear_pending_prompt(state, delegate_process)
+        set_model(state, delegate_process, get_model(state, chat_id))
+        set_permission_mode(state, delegate_process, get_permission_mode(state, chat_id))
+        set_workspace(state, delegate_process, workspace or get_workspace(state, chat_id))
+
+    # This marker is stored on the delegate entry, so the footer can expose
+    # the owner's pre-delegation session without ever overwriting the owner
+    # entry when the delegate result arrives.
+    set_pending_delegator(state, delegate_process, owner_session_id or "")
+    spawn_turn(
+        delegate_process,
+        prompt,
+        state,
+        output_chat_id=chat_id,
+        delegated=True,
+    )
+    return True
 
 
 # Forwarding a batch of messages (or just typing several in quick succession)
@@ -382,6 +487,7 @@ def cancel_pending_batch(chat_id):
     with pending_batches_lock:
         timer = batch_timers.pop(chat_id, None)
         pending_batches.pop(chat_id, None)
+        pending_batch_output_chats.pop(chat_id, None)
         pending_batch_generations[chat_id] = pending_batch_generations.get(chat_id, 0) + 1
     if timer:
         timer.cancel()
@@ -393,6 +499,7 @@ def _flush_pending_batch(chat_id, state, generation):
             return
         prompts = pending_batches.pop(chat_id, [])
         batch_timers.pop(chat_id, None)
+        output_chat_id = pending_batch_output_chats.pop(chat_id, None)
         pending_batch_generations.pop(chat_id, None)
 
     if not prompts:
@@ -400,18 +507,38 @@ def _flush_pending_batch(chat_id, state, generation):
     combined = prompts[0] if len(prompts) == 1 else "\n\n---\n\n".join(prompts)
     try:
         if chat_id in busy_chats:
-            dispatch_turn(chat_id, combined, state)
+            if output_chat_id is None:
+                dispatch_turn(chat_id, combined, state)
+            else:
+                dispatch_turn(
+                    chat_id,
+                    combined,
+                    state,
+                    output_chat_id=output_chat_id,
+                    delegated=True,
+                )
         else:
-            spawn_turn(chat_id, combined, state)
+            if output_chat_id is None:
+                spawn_turn(chat_id, combined, state)
+            else:
+                spawn_turn(
+                    chat_id,
+                    combined,
+                    state,
+                    output_chat_id=output_chat_id,
+                    delegated=True,
+                )
     except Exception:
         err = traceback.format_exc()[-1500:]
         print(err, flush=True)
-        send_message(chat_id, f"Ошибка моста:\n```\n{err}\n```")
+        send_message(output_chat_id or chat_id, f"Ошибка моста:\n```\n{err}\n```")
 
 
-def queue_prompt(chat_id, prompt, state):
+def queue_prompt(chat_id, prompt, state, output_chat_id=None):
     with pending_batches_lock:
         pending_batches.setdefault(chat_id, []).append(prompt)
+        if output_chat_id is not None:
+            pending_batch_output_chats[chat_id] = output_chat_id
         generation = pending_batch_generations.get(chat_id, 0) + 1
         pending_batch_generations[chat_id] = generation
         old_timer = batch_timers.get(chat_id)
@@ -425,19 +552,41 @@ def queue_prompt(chat_id, prompt, state):
     timer.start()
 
 
-def dispatch_turn(chat_id, prompt, state, force_permission_mode=None):
+def route_prompt(chat_id, prompt, state):
+    process_key = process_key_for_incoming(chat_id)
+    if process_key == chat_id:
+        queue_prompt(process_key, prompt, state)
+    else:
+        queue_prompt(process_key, prompt, state, output_chat_id=chat_id)
+
+
+def dispatch_turn(
+    chat_id, prompt, state, force_permission_mode=None, output_chat_id=None, delegated=False,
+):
     """Write one prompt onto chat_id's persistent process. Non-blocking --
     see send_turn_to_chat_process's docstring. Delivery (final answer,
     attachments, denial handling via /approve|/approve session|/deny) all
     happens later, asynchronously, in _chat_reader_loop / _deliver_turn_result."""
-    send_typing(chat_id)
+    telegram_chat_id = chat_id if output_chat_id is None else output_chat_id
+    settings_chat_id = chat_id if delegated else telegram_chat_id
+    send_typing(telegram_chat_id)
 
-    model = get_model(state, chat_id)
-    permission_mode = force_permission_mode or get_permission_mode(state, chat_id)
-    workspace = get_workspace(state, chat_id)
-    config_dir = account_dir(chat_id)
+    model = get_model(state, settings_chat_id)
+    permission_mode = force_permission_mode or get_permission_mode(state, settings_chat_id)
+    workspace = get_workspace(state, settings_chat_id)
+    config_dir = account_dir(telegram_chat_id)
 
-    send_turn_to_chat_process(chat_id, prompt, state, model, permission_mode, workspace, config_dir)
+    send_turn_to_chat_process(
+        chat_id,
+        prompt,
+        state,
+        model,
+        permission_mode,
+        workspace,
+        config_dir,
+        output_chat_id=telegram_chat_id,
+        delegated=delegated,
+    )
 
 
 LOGIN_TIMEOUT_S = 180
