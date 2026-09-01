@@ -23,12 +23,13 @@ import time
 import traceback
 
 from runtime import (
-    SERVICE_NAME, WAKEUP_SIGNAL_DIR, busy_chats, chat_procs, chat_procs_lock,
-    current_offset, load_whitelist,
+    EXTERNAL_REQUEST_FILE, OWNER_ID, SERVICE_NAME, WAKEUP_SIGNAL_DIR, busy_chats,
+    chat_procs, chat_procs_lock, current_offset, load_whitelist,
 )
 from state_store import (
     clear_pending_prompt, get_pending_prompt, load_state, pop_pending_restart,
-    pop_restart_request, set_pending_restart, set_permission_mode,
+    pop_restart_request, set_pending_delegator, set_pending_restart, set_permission_mode,
+    set_session, set_workspace,
 )
 from chat_process import (
     _chat_proc_idle_reaper_loop, _shutdown_chat_processes, _stop_chat_process,
@@ -208,6 +209,53 @@ def _restart_watcher_loop(state):
         subprocess.Popen(["sudo", "-n", "systemctl", "restart", SERVICE_NAME])
 
 
+def _external_request_watcher_loop(state):
+    """Local, non-Telegram input channel, symmetric to codex-telegram-bot's
+    external_request_watcher(). A bot can never see its own outgoing
+    messages via getUpdates -- Telegram simply does not deliver them back
+    to the sender, confirmed live 2026-09-01, not something fixable at the
+    code level, and no other identity can inject into a private 1:1 chat
+    either. Since this bridge is our own code, the fix is to skip Telegram
+    for this leg entirely: bridge_exec.py (Codex's copy, delegating TO
+    Claude) writes a request file here instead of pretending to be an
+    incoming message, and this feeds it straight into queue_prompt() --
+    the exact same entry point a real incoming Telegram message reaches.
+    Real human steering via Telegram is untouched; this is a second,
+    independent input path into the same live turn, not a replacement."""
+    while True:
+        time.sleep(1)
+        if not os.path.exists(EXTERNAL_REQUEST_FILE):
+            continue
+        try:
+            with open(EXTERNAL_REQUEST_FILE, encoding="utf-8") as f:
+                request = json.load(f)
+        except Exception as exc:
+            print(f"Could not read external request: {exc}", flush=True)
+            request = None
+        try:
+            os.remove(EXTERNAL_REQUEST_FILE)
+        except FileNotFoundError:
+            pass
+        if not isinstance(request, dict):
+            continue
+        chat_id = request.get("chat_id") or OWNER_ID
+        text = request.get("text")
+        if not text:
+            continue
+        if request.get("workspace"):
+            set_workspace(state, chat_id, request["workspace"])
+        if request.get("resume_session_id"):
+            set_session(state, chat_id, request["resume_session_id"])
+        # Marks the NEXT completed turn as delegated so its footer carries
+        # the delegator's own session id (see chat_process.py's
+        # _format_turn_footer) -- ordinary human-typed turns never set
+        # this, so they never get that footer at all: it is a delegation
+        # mechanism, not a per-message one, per the owner directly.
+        if request.get("delegator_session_id"):
+            set_pending_delegator(state, chat_id, request["delegator_session_id"])
+        queue_prompt(chat_id, text, state)
+
+
 def _pop_wakeup_signals():
     """Returns a list of {"chat_id", "note"} dicts, one per valid signal
     file found -- unlike pop_restart_request (one global restart, at most
@@ -309,6 +357,7 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown_chat_processes)
 
     threading.Thread(target=_restart_watcher_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=_external_request_watcher_loop, args=(state,), daemon=True).start()
     threading.Thread(target=_wakeup_watcher_loop, args=(state,), daemon=True).start()
     threading.Thread(target=_chat_proc_idle_reaper_loop, daemon=True).start()
 

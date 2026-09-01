@@ -1,6 +1,8 @@
 # Runtime state -- per-deployment, never shared
 state*.json
 codex_bot_state.json
+last_turn_*.json
+external_request.json
 whitelist.txt
 accounts/
 uploads_*/
@@ -13,3 +15,5 @@ claude-telegram.service
 
 # Personal, unrelated work-in-progress -- not part of this project
 jarvis-ask/
+
+graphify-out/

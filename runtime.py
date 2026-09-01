@@ -104,6 +104,10 @@ WHITELIST_FILE = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)), "whitelist.txt"
 )
 RESTART_SIGNAL_FILE = STATE_FILE + ".restart_signal"
+EXTERNAL_REQUEST_FILE = os.environ.get(
+    "BRIDGE_EXTERNAL_REQUEST_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(STATE_FILE)), "external_request.json"),
+)
 ACCOUNTS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)), "accounts"
 )

@@ -39,6 +39,17 @@ def set_session(state, chat_id, session_id):
         save_state(state)
 
 
+def get_pending_delegator(state, chat_id):
+    return state.get(str(chat_id), {}).get("pending_delegator_session_id")
+
+
+def set_pending_delegator(state, chat_id, session_id):
+    with state_lock:
+        entry = state.setdefault(str(chat_id), {})
+        entry["pending_delegator_session_id"] = session_id
+        save_state(state)
+
+
 def clear_session(state, chat_id):
     with state_lock:
         entry = state.get(str(chat_id))

@@ -8,13 +8,13 @@ import time
 import traceback
 
 from runtime import (
-    CHAT_PROC_IDLE_TIMEOUT_S, CLAUDE_BIN, EDIT_THROTTLE_S,
+    CHAT_PROC_IDLE_TIMEOUT_S, CLAUDE_BIN, EDIT_THROTTLE_S, STATE_FILE,
     THINKING_SPINNER_FRAMES, WORKDIR, busy_chats, chat_procs,
     chat_procs_lock, claude_env,
 )
 from state_store import (
-    add_usage, clear_pending_prompt, get_session, reset_cost_warning_baseline,
-    set_pending_prompt, set_session,
+    add_usage, clear_pending_prompt, get_pending_delegator, get_session,
+    reset_cost_warning_baseline, set_pending_delegator, set_pending_prompt, set_session,
 )
 from telegram_api import (
     edit_rich, extract_existing_files, send_attachment, send_message, send_rich,
@@ -62,6 +62,49 @@ def _draft_clean(s, limit=200):
     return re.sub(r"\s+", " ", s).strip()[:limit]
 
 
+def write_last_turn(chat_id, text):
+    """Signal a completed turn's final text via a plain file instead of
+    Telegram's getUpdates -- this process already owns that bot token's
+    getUpdates stream exclusively (only one consumer can ever see a given
+    update), so an external script polling the same API would just starve.
+    bridge_exec.py polls this file instead."""
+    path = os.path.join(os.path.dirname(STATE_FILE), f"last_turn_{chat_id}.json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"text": text, "ts": time.time()}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _format_turn_footer(state, chat_id, ts):
+    """Токены on every turn; "Session id: X / resume Y" only on a
+    DELEGATED turn (X = the delegator's own session, Y = this bridge's
+    session to resume) -- per the owner directly, that pair is a
+    delegation mechanism, not a per-message one, symmetric to
+    codex-telegram-bot's identical fix in bot.py's run_turn finalize."""
+    parts = []
+    usage = ts.get("last_usage")
+    if usage:
+        token_parts = []
+        for key, label in (("input_tokens", "in"), ("cache_read_input_tokens", "cached"),
+                            ("output_tokens", "out")):
+            if key in usage:
+                token_parts.append(f"{label}: {usage[key]}")
+        if token_parts:
+            parts.append(f"Токены: {', '.join(token_parts)}")
+    session_id = ts.get("current_session_id")
+    delegator_session_id = get_pending_delegator(state, chat_id)
+    if delegator_session_id and session_id:
+        parts.append(
+            f"Твой session id: `{delegator_session_id[:8]}`. "
+            f"Продолжить: `/resume {session_id[:8]}`"
+        )
+        set_pending_delegator(state, chat_id, None)
+    return "\n\n".join(parts)
+
+
 def _new_turn_accumulator(state, chat_id):
     """Fresh per-turn accumulator for _chat_reader_loop. One of these is
     live at a time per chat process; reset right after each delivered
@@ -71,6 +114,7 @@ def _new_turn_accumulator(state, chat_id):
         "current_session_id": get_session(state, chat_id),
         "last_draft_edit": 0.0,
         "final_text": None,
+        "last_usage": None,
         "last_text_log_index": None,
         "last_text_log_raw": None,
         "denials": [],
@@ -252,6 +296,11 @@ def _deliver_turn_result(chat_id, state, ts, prompt, proc, stopped=False):
             send_rich(chat_id, process_rich_text)
 
     final_payload = text_out or "(пусто)"
+    if not stopped:
+        footer = _format_turn_footer(state, chat_id, ts)
+        if footer:
+            final_payload = f"{final_payload}\n\n{footer}"
+        write_last_turn(chat_id, final_payload)
     if ts["progress_msg_id"] is not None and not progress_became_process_block:
         # Either there was no tool-call content at all (a plain
         # conversational turn), or there was but it already got absorbed
@@ -526,6 +575,7 @@ def _chat_reader_loop(chat_id, state, record):
             if t == "result":
                 ts["current_session_id"] = d.get("session_id") or ts["current_session_id"]
                 ts["final_text"] = d.get("result", "")
+                ts["last_usage"] = d.get("usage") or {}
                 ts["denials"].extend(d.get("permission_denials") or [])
                 add_usage(state, chat_id, ts["current_session_id"], d)
                 with record["write_lock"]:
