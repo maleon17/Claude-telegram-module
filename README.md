@@ -65,6 +65,12 @@ If you'd rather not run a script with `sudo`, do it by hand:
 | `/approve` / `/approve session` | Allow a blocked tool call once, or bypass for the rest of the session |
 | `/deny` | Reject a blocked tool call |
 | `/login` | Start/re-authenticate the Claude account for this chat (including the owner account) |
+| `/restart` | Owner-only: safe deferred restart (waits for in-flight turns to finish) |
+| `/update` | Owner-only: `git pull` the latest push, then restart the same way `/restart` does |
+
+## Updating
+
+Either run `./update.sh` on the host, or send `/update` from the owner chat — both do the same thing (`git fetch` + fast-forward-only merge, then a deferred restart once no turn is in flight). Nothing to edit by hand: the bot token and owner ID live in the generated systemd unit, not in a file `git pull` would touch, so they survive every update.
 
 ## Multi-tenancy: giving someone else access
 

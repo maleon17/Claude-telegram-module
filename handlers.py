@@ -47,6 +47,7 @@ COMMANDS = [
     ("deny", "Отклонить заблокированное действие"),
     ("login", "Переподключить свой аккаунт Claude"),
     ("restart", "Перезапустить бота (только для владельца)"),
+    ("update", "Обновить бота из git и перезапустить (только для владельца)"),
 ]
 
 
@@ -290,6 +291,35 @@ def handle_command(chat_id, text, state, offset=None):
                 chat_id,
                 "🔁 Перезапуск запланирован — выполнится, как только текущие запросы завершатся.",
             )
+        return True
+
+    if cmd == "update":
+        if str(chat_id) != str(OWNER_ID):
+            send_message(chat_id, "Обновление доступно только владельцу.")
+            return True
+        if not SERVICE_NAME:
+            send_message(chat_id, "SERVICE_NAME не задан в systemd-юните — автоперезапуск недоступен.")
+            return True
+        send_message(chat_id, "⬇️ Обновляю из git...")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.sh")
+        try:
+            result = subprocess.run(
+                [script], capture_output=True, text=True, timeout=120, check=False,
+            )
+        except Exception as e:
+            send_message(chat_id, f"❌ Не смог запустить update.sh: {e}")
+            return True
+        if result.returncode != 0:
+            output = (result.stderr or result.stdout or "").strip()[-2000:]
+            send_message(chat_id, f"❌ Обновление не удалось:\n```\n{output}\n```")
+            return True
+        summary = (result.stdout or "").strip().splitlines()[-1:] or ["обновлено"]
+        # Same deferred-restart mechanism as /restart: never kill a turn
+        # (possibly this very one) mid-answer, only restart once idle.
+        cancel_pending_batch(chat_id)
+        request_restart(chat_id)
+        note = " Перезапуск — как только текущие запросы завершатся." if busy_chats else " Перезапуск — между ходами."
+        send_message(chat_id, f"✅ {summary[0]}.{note}")
         return True
 
     return False
