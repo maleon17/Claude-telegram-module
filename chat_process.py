@@ -14,7 +14,8 @@ from runtime import (
 )
 from state_store import (
     add_usage, clear_pending_prompt, get_pending_delegator, get_session,
-    reset_cost_warning_baseline, set_pending_delegator, set_pending_prompt, set_session,
+    reset_cost_warning_baseline, set_pending_delegator, set_pending_prompt,
+    set_session,
 )
 from telegram_api import (
     edit_rich, extract_existing_files, send_attachment, send_message, send_rich,
@@ -108,6 +109,13 @@ def _format_turn_footer(state, chat_id, ts):
         else:
             parts.append(f"Продолжить делегированную сессию: `/resume {session_id[:8]}`")
         set_pending_delegator(state, chat_id, None)
+        # The delegated session is live only for this one turn -- restore
+        # the owner's own pre-delegation session right away (mirrors the
+        # identical fix in codex-telegram-bot's bot.py run_turn finalize)
+        # so their next ordinary Telegram message continues their own
+        # conversation, not the delegated one. `/resume <id>` above still
+        # works to explicitly continue the delegated session instead.
+        set_session(state, chat_id, prior_session_id or None)
     return "\n\n".join(parts)
 
 
