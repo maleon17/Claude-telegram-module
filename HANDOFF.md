@@ -17,17 +17,17 @@ host and streams the result back.
 This bridge is one of four small, independent projects that share design ideas
 and a couple of helper scripts but no import-level coupling:
 
-- **Claude bridge (this repo)** — https://github.com/maleon17/Claude-telegram-bot
+- **Claude bridge (this repo)** — https://github.com/maleon17/claude-telegram-bridge
   Personal Claude Code ↔ Telegram bridge, Bot-API bot, one persistent Claude
   process per chat.
-- **Codex bot** — https://github.com/maleon17/Codex-telegram-bot
+- **Codex bot** — https://github.com/maleon17/codex-telegram-bridge
   The same idea for Codex CLI: an interactive `codex app-server` driven from
   Telegram, with real mid-turn steering.
-- **ClaudeAsk userbot** — https://github.com/maleon17/Claude-jarvis
+- **ClaudeAsk userbot** — https://github.com/maleon17/claude-ask
   A Telethon userbot *module* (`.ask` / `.search` / `.translate`) with a
   "Jarvis" persona, Claude backend. Runs as a user account, edits the caller's
   own message in place. Backend = `claude_watcher.py` + an HTTP queue relay.
-- **CodexAsk userbot** — https://github.com/maleon17/Codex-jarvis
+- **CodexAsk userbot** — https://github.com/maleon17/codex-ask
   Same as ClaudeAsk, Codex backend, `.xask` / `.xsearch` / `.xtranslate`.
 
 `bridge_exec.py` (in this repo and in the Codex bot repo) is a thin

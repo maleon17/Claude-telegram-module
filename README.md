@@ -1,4 +1,6 @@
-# Claude-telegram-bot
+# claude-telegram-bridge
+
+> Part of **[telegram-ai](https://github.com/maleon17/telegram-ai)** — Claude/Codex ↔ Telegram, four ways.
 
 A Telegram bridge for [Claude Code](https://claude.com/claude-code) — message Claude from Telegram using your own Claude subscription (Pro/Max/Team), not a metered API key.
 
@@ -29,7 +31,7 @@ claude auth login --claudeai
 
 # 2. Clone this repo
 git clone https://github.com/<your-username>/Claude-telegram-bot.git
-cd Claude-telegram-bot
+cd claude-telegram-bridge
 
 # 3. Run the installer -- it'll ask for your bot token and Telegram ID
 ./setup.sh
