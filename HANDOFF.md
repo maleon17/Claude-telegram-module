@@ -17,7 +17,7 @@ host and streams the result back.
 This bridge is one of four small, independent projects that share design ideas
 and a couple of helper scripts but no import-level coupling:
 
-- **Claude bridge (this repo)** — https://github.com/maleon17/Claude-telegram-module
+- **Claude bridge (this repo)** — https://github.com/maleon17/Claude-telegram-bot
   Personal Claude Code ↔ Telegram bridge, Bot-API bot, one persistent Claude
   process per chat.
 - **Codex bot** — https://github.com/maleon17/Codex-telegram-bot

@@ -1,4 +1,4 @@
-# Claude-telegram-module
+# Claude-telegram-bot
 
 A Telegram bridge for [Claude Code](https://claude.com/claude-code) — message Claude from Telegram using your own Claude subscription (Pro/Max/Team), not a metered API key.
 
@@ -28,8 +28,8 @@ Drives `claude -p --output-format=stream-json` per message and streams progress 
 claude auth login --claudeai
 
 # 2. Clone this repo
-git clone https://github.com/<your-username>/Claude-telegram-module.git
-cd Claude-telegram-module
+git clone https://github.com/<your-username>/Claude-telegram-bot.git
+cd Claude-telegram-bot
 
 # 3. Run the installer -- it'll ask for your bot token and Telegram ID
 ./setup.sh
