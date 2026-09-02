@@ -106,3 +106,59 @@ echo
 echo "Next: message your bot on Telegram to start using it."
 echo "Logs:   journalctl -u ${SERVICE_NAME}.service -f"
 echo "Whitelist for other users: edit whitelist.txt in $INSTALL_DIR (comma/newline-separated IDs, no restart needed)."
+
+# --- optional: example personality file -----------------------------------
+if [ -t 0 ] && [ -f "$SCRIPT_DIR/personality.example.md" ]; then
+    echo
+    echo "The bridged assistant has no voice of its own beyond your CLAUDE.md."
+    echo "personality.example.md in this repo is a starting point you can install."
+    read -rp "Install it to  [1] ~/.claude/CLAUDE.md  [2] a path you choose  [3] skip : " P_CHOICE || P_CHOICE=3
+    case "${P_CHOICE:-3}" in
+        1) P_DEST="$HOME/.claude/CLAUDE.md" ;;
+        2) read -rp "Path for the personality file: " P_DEST || P_DEST="" ;;
+        *) P_DEST="" ;;
+    esac
+    if [ -n "${P_DEST:-}" ]; then
+        mkdir -p "$(dirname "$P_DEST")"
+        P_BODY="$(sed '/^<!--/,/-->/d' "$SCRIPT_DIR/personality.example.md")"
+        if [ -f "$P_DEST" ] && grep -q 'BEGIN personality.example' "$P_DEST"; then
+            echo "$P_DEST already has a personality.example block - left as is."
+        else
+            {
+                [ -f "$P_DEST" ] && printf '\n'
+                printf '<!-- BEGIN personality.example -->\n'
+                printf '%s\n' "$P_BODY"
+                printf '<!-- END personality.example -->\n'
+            } >> "$P_DEST"
+            echo "Installed the example personality to $P_DEST"
+        fi
+    fi
+fi
+
+# --- optional: graphify code-map -------------------------------------------
+# graphify (PyPI package "graphifyy", github.com/Graphify-Labs/graphify) turns
+# this repo into a queryable knowledge graph under graphify-out/. Optional.
+setup_graphify() {
+    local platform="$1"
+    if command -v graphify >/dev/null 2>&1; then
+        echo "graphify: already on PATH ($(command -v graphify))"
+    elif command -v uv >/dev/null 2>&1; then
+        uv tool install graphifyy || { echo "graphify: install failed, skipping"; return 0; }
+    elif command -v pipx >/dev/null 2>&1; then
+        pipx install graphifyy || { echo "graphify: install failed, skipping"; return 0; }
+    else
+        echo "graphify: needs 'uv' or 'pipx' to install - skipping"
+        return 0
+    fi
+    graphify install --platform "$platform" >/dev/null 2>&1 || true
+    graphify update . >/dev/null 2>&1 || true
+    echo "graphify: code map built under graphify-out/ (re-run 'graphify update .' after edits;"
+    echo "          a post-commit hook keeps it fresh if graphify installed one)"
+}
+
+if [ -t 0 ]; then
+    read -rp "Set up the graphify code-map for this repo? [y/N] " _SETUP_GRAPHIFY || _SETUP_GRAPHIFY=""
+    case "${_SETUP_GRAPHIFY:-}" in
+        [Yy]*) setup_graphify "claude" ;;
+    esac
+fi
