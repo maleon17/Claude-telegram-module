@@ -629,6 +629,11 @@ def _chat_reader_loop(chat_id, state, record):
                     )
                 except Exception:
                     print(traceback.format_exc()[-1500:], flush=True)
+                if record.get("close_after_turn"):
+                    # A per-turn secret must not remain in a warm persistent
+                    # process after its delegated result has been delivered.
+                    _stop_chat_process(chat_id)
+                    return
                 with chat_procs_lock:
                     if chat_procs.get(chat_id, {}).get("proc") is proc:
                         busy_chats.discard(chat_id)
@@ -675,7 +680,7 @@ def _chat_process_signature(model, permission_mode, workspace, config_dir):
 
 def _start_chat_process(
     chat_id, model, permission_mode, workspace, config_dir, session_id, state,
-    output_chat_id=None, delegated=False,
+    output_chat_id=None, delegated=False, extra_env=None,
 ):
     telegram_chat_id = chat_id if output_chat_id is None else output_chat_id
     args = [
@@ -698,7 +703,7 @@ def _start_chat_process(
     proc = subprocess.Popen(
         args,
         cwd=workspace or WORKDIR,
-        env=claude_env(config_dir, telegram_chat_id),
+        env=claude_env(config_dir, telegram_chat_id, extra_env=extra_env),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -713,6 +718,7 @@ def _start_chat_process(
         "write_lock": threading.Lock(),
         "telegram_chat_id": telegram_chat_id,
         "delegated": delegated,
+        "close_after_turn": bool(extra_env),
     }
     with chat_procs_lock:
         chat_procs[chat_id] = record
@@ -745,7 +751,7 @@ def _stop_chat_process(chat_id):
 
 def _ensure_chat_process(
     chat_id, model, permission_mode, workspace, config_dir, state,
-    output_chat_id=None, delegated=False,
+    output_chat_id=None, delegated=False, extra_env=None,
 ):
     """Returns a live process record for chat_id, starting or restarting
     one if needed. A restart is needed if there's no process yet, the
@@ -756,7 +762,12 @@ def _ensure_chat_process(
     wanted_sig = _chat_process_signature(model, permission_mode, workspace, config_dir)
     with chat_procs_lock:
         record = chat_procs.get(chat_id)
-    if record and record["proc"].poll() is None and record["signature"] == wanted_sig:
+    if (
+        record
+        and not extra_env
+        and record["proc"].poll() is None
+        and record["signature"] == wanted_sig
+    ):
         return record
     if record:
         _stop_chat_process(chat_id)
@@ -771,12 +782,13 @@ def _ensure_chat_process(
         state,
         output_chat_id=output_chat_id,
         delegated=delegated,
+        extra_env=extra_env,
     )
 
 
 def send_turn_to_chat_process(
     chat_id, prompt, state, model=None, permission_mode=None, workspace=None, config_dir=None,
-    output_chat_id=None, delegated=False,
+    output_chat_id=None, delegated=False, extra_env=None,
 ):
     """Non-blocking: ensures chat_id's persistent process is up (spawning
     or respawning it if needed) and writes `prompt` onto its stdin as one
@@ -798,6 +810,7 @@ def send_turn_to_chat_process(
         state,
         output_chat_id=output_chat_id,
         delegated=delegated,
+        extra_env=extra_env,
     )
     msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}
     with record["write_lock"]:

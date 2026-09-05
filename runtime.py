@@ -115,6 +115,23 @@ EXTERNAL_REQUEST_FILE = os.environ.get(
 ACCOUNTS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(STATE_FILE)), "accounts"
 )
+DELEGATED_ACCOUNTS_DIR = os.path.join(ACCOUNTS_DIR, "delegated")
+
+# These are bridge control-plane values, not Claude Code configuration.  Do
+# not let them cross the process boundary into a Claude child process.
+BRIDGE_ENV_VARS = frozenset({
+    "TELEGRAM_BOT_TOKEN",
+    "OWNER_ID",
+    "BRIDGE_WORKDIR",
+    "BRIDGE_STATE_FILE",
+    "CLAUDE_BIN",
+    "SERVICE_NAME",
+    "BRIDGE_EXTERNAL_REQUEST_FILE",
+    "BRIDGE_EXEC_EXTERNAL_REQUEST_FILE",
+    "BRIDGE_EXEC_STATE_FILE",
+    "CHAT_ID",
+    "WAKEUP_SIGNAL_DIR",
+})
 
 # Background-task wakeup (LEGACY, kept as a harmless fallback -- see 2026-
 # 08-18 migration note on `chat_procs` above): originally built because a
@@ -151,7 +168,33 @@ def load_whitelist():
     return ids
 
 
-def account_dir(chat_id):
+def default_claude_config_dir():
+    return os.path.abspath(
+        os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"))
+    )
+
+
+def _ensure_symlink(link_path, target_path):
+    if os.path.islink(link_path):
+        if os.path.realpath(link_path) == os.path.realpath(target_path):
+            return
+        os.unlink(link_path)
+    elif os.path.exists(link_path):
+        os.unlink(link_path)
+    os.symlink(target_path, link_path)
+
+
+def account_dir(chat_id, state_key=None):
+    delegated = state_key is not None and str(state_key) != str(chat_id)
+    if delegated:
+        d = os.path.join(DELEGATED_ACCOUNTS_DIR, str(chat_id))
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        shared_dir = account_dir(chat_id) or default_claude_config_dir()
+        # OAuth is live state: share it by symlink so token refreshes remain
+        # visible, while sessions/projects/history stay in the delegate dir.
+        credentials = os.path.join(shared_dir, ".credentials.json")
+        _ensure_symlink(os.path.join(d, ".credentials.json"), credentials)
+        return d
     if str(chat_id) == str(OWNER_ID):
         return None  # default ~/.claude, unchanged behavior
     d = os.path.join(ACCOUNTS_DIR, str(chat_id))
@@ -159,17 +202,22 @@ def account_dir(chat_id):
     return d
 
 
-def claude_env(config_dir, chat_id=None):
-    # Used to short-circuit to None (inherit parent env as-is) when there
-    # was nothing to override -- now always builds an explicit dict once
-    # chat_id needs injecting too. Functionally equivalent for existing
-    # callers that don't pass chat_id and have no config_dir: an explicit
-    # copy of os.environ behaves the same as env=None for Popen.
-    if not config_dir and chat_id is None:
-        return None
-    env = dict(os.environ)
+def claude_env(config_dir, chat_id=None, extra_env=None):
+    parent_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in BRIDGE_ENV_VARS
+    }
+    if extra_env:
+        env.update(extra_env)
+    for key in BRIDGE_ENV_VARS:
+        env.pop(key, None)
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir
+    elif parent_config_dir:
+        env["CLAUDE_CONFIG_DIR"] = parent_config_dir
+    else:
+        env.pop("CLAUDE_CONFIG_DIR", None)
     if chat_id is not None:
         # Lets a backgrounded shell command self-report completion without
         # Claude needing to already know/hardcode its own chat_id -- see

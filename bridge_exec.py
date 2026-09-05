@@ -17,7 +17,8 @@ product for free -- only the INPUT side bypasses Telegram now.
 
 Usage:
     bridge_exec.py [--workspace PATH] [--resume ID] [--chat-id ID]
-                    [--timeout SECONDS] PROMPT...
+                    [--timeout SECONDS] [--model "family [version]"]
+                    [--env KEY=VALUE ...] PROMPT...
 
 Every call through this script is a delegated turn by definition, so the
 final answer's footer always notes it -- the OWNER's own session from
@@ -88,14 +89,46 @@ def poll_until_done(chat_id, baseline_ts, timeout_s, poll_interval=2):
     raise TimeoutError(f'No completed turn signalled via {path} within {timeout_s}s.')
 
 
+def parse_env_assignments(assignments):
+    result = {}
+    for assignment in assignments:
+        key, separator, value = assignment.partition("=")
+        if not separator or not key:
+            raise ValueError("--env expects KEY=VALUE")
+        result[key] = value
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", help="switch workspace before the prompt")
     parser.add_argument("--resume", help="resume this session id before the prompt")
     parser.add_argument("--chat-id", type=int, help="override the target chat (default: OWNER_ID)")
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument(
+        "--model",
+        help="select a Claude model family and optional version, e.g. 'opus 4.7' or default",
+    )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="pass one environment variable to a fresh delegated turn; repeatable",
+    )
     parser.add_argument("prompt", nargs="+")
     args = parser.parse_args()
+
+    if args.resume and args.env:
+        print("--env нельзя использовать вместе с --resume.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        requested_env = parse_env_assignments(args.env)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+    model_spec = args.model
 
     chat_id = args.chat_id or int(os.environ.get("OWNER_ID") or DEFAULT_OWNER_ID)
 
@@ -119,6 +152,10 @@ def main():
         request["workspace"] = args.workspace
     if args.resume:
         request["resume_session_id"] = args.resume
+    if model_spec is not None:
+        request["model"] = model_spec
+    if requested_env:
+        request["env"] = requested_env
     # Every request through this file channel is a delegated one by
     # definition (a human never writes this file) -- bridge.py's watcher
     # captures the owner's own PRIOR session itself and shows it back in

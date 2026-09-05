@@ -36,6 +36,26 @@ PERMISSION_MODES = ("bypass", "default", "acceptEdits", "plan")
 pending_batch_output_chats = {}
 
 
+def resolve_model_spec(spec):
+    parts = str(spec or "").lower().split()
+    if not parts or parts[0] == "default":
+        return None
+
+    choice = parts[0]
+    if choice not in MODEL_VERSIONS:
+        raise ValueError(
+            f"Неизвестное семейство. Доступно: {', '.join(MODEL_ALIASES)}, default"
+        )
+
+    versions = MODEL_VERSIONS[choice]
+    version = versions[-1] if len(parts) == 1 else parts[1]
+    if version not in versions:
+        raise ValueError(
+            f"У {choice} нет версии {version}. Доступно: {', '.join(versions)}"
+        )
+    return f"claude-{choice}-{version.replace('.', '-')}"
+
+
 def process_key_for_incoming(chat_id):
     """Route a real Telegram message to a busy delegated process, if any."""
     delegate_process = delegate_key(chat_id)
@@ -204,31 +224,20 @@ def handle_command(chat_id, text, state, offset=None):
             send_message(chat_id, "\n".join(lines))
             return True
 
-        parts = arg.lower().split()
-        choice = parts[0]
+        try:
+            model_id = resolve_model_spec(arg)
+        except ValueError as exc:
+            send_message(chat_id, str(exc))
+            return True
 
-        if choice == "default":
+        if model_id is None:
             set_model(state, chat_id, None)
             send_message(chat_id, "Модель сброшена на дефолтную.")
             return True
 
-        if choice not in MODEL_VERSIONS:
-            send_message(chat_id, f"Неизвестное семейство. Доступно: {', '.join(MODEL_ALIASES)}, default")
-            return True
-
-        versions = MODEL_VERSIONS[choice]
-        if len(parts) == 1:
-            version = versions[-1]
-        else:
-            version = parts[1]
-            if version not in versions:
-                send_message(
-                    chat_id,
-                    f"У {choice} нет версии {version}. Доступно: {', '.join(versions)}",
-                )
-                return True
-
-        model_id = f"claude-{choice}-{version.replace('.', '-')}"
+        parts = arg.lower().split()
+        choice = parts[0]
+        version = MODEL_VERSIONS[choice][-1] if len(parts) == 1 else parts[1]
         set_model(state, chat_id, model_id)
         send_message(chat_id, f"Модель переключена на {choice} {version} (`{model_id}`).")
         return True
@@ -364,6 +373,7 @@ def register_commands():
 
 def _run_turn_thread(
     chat_id, prompt, state, force_permission_mode=None, output_chat_id=None, delegated=False,
+    extra_env=None,
 ):
     """dispatch_turn() now only ensures the chat's persistent process and
     writes the prompt to its stdin -- it returns almost immediately, long
@@ -380,6 +390,7 @@ def _run_turn_thread(
             force_permission_mode=force_permission_mode,
             output_chat_id=output_chat_id,
             delegated=delegated,
+            extra_env=extra_env,
         )
     except Exception:
         err = traceback.format_exc()[-1500:]
@@ -393,6 +404,7 @@ def _run_turn_thread(
 
 def spawn_turn(
     chat_id, prompt, state, force_permission_mode=None, output_chat_id=None, delegated=False,
+    extra_env=None,
 ):
     """Run a turn in the background so the poll loop stays responsive to
     /stop and other commands while `claude` is running."""
@@ -410,12 +422,16 @@ def spawn_turn(
             "force_permission_mode": force_permission_mode,
             "output_chat_id": output_chat_id,
             "delegated": delegated,
+            "extra_env": extra_env,
         },
         daemon=True,
     ).start()
 
 
-def start_delegate_turn(chat_id, prompt, state, resume_session_id=None, workspace=None):
+def start_delegate_turn(
+    chat_id, prompt, state, resume_session_id=None, workspace=None,
+    model_spec=None, env=None,
+):
     """Start one isolated, persistent turn for bridge_exec.py.
 
     The delegate has its own bookkeeping key and Claude process, while all
@@ -425,9 +441,20 @@ def start_delegate_turn(chat_id, prompt, state, resume_session_id=None, workspac
     """
     delegate_process = delegate_key(chat_id)
     requested_session_id = str(resume_session_id or "").strip() or None
+    requested_env = dict(env or {})
+    model_requested = model_spec is not None
+    try:
+        requested_model = resolve_model_spec(model_spec) if model_requested else None
+    except ValueError as exc:
+        _delegate_error(chat_id, str(exc))
+        return False
 
     if delegate_process in busy_chats:
         _delegate_error(chat_id, "Уже выполняю предыдущую делегированную задачу.")
+        return False
+
+    if requested_session_id and requested_env:
+        _delegate_error(chat_id, "Нельзя использовать --env вместе с --resume.")
         return False
 
     cancel_pending_batch(delegate_process)
@@ -453,13 +480,19 @@ def start_delegate_turn(chat_id, prompt, state, resume_session_id=None, workspac
             return False
         if workspace:
             set_workspace(state, delegate_process, workspace)
+        if model_requested:
+            set_model(state, delegate_process, requested_model)
     else:
         # A default delegation is always fresh. Stop only the idle delegate
         # slot; the owner's independent process is never touched here.
         _stop_chat_process(delegate_process)
         clear_session(state, delegate_process)
         clear_pending_prompt(state, delegate_process)
-        set_model(state, delegate_process, get_model(state, chat_id))
+        set_model(
+            state,
+            delegate_process,
+            requested_model if model_requested else get_model(state, chat_id),
+        )
         set_permission_mode(state, delegate_process, get_permission_mode(state, chat_id))
         set_workspace(state, delegate_process, workspace or get_workspace(state, chat_id))
 
@@ -473,6 +506,7 @@ def start_delegate_turn(chat_id, prompt, state, resume_session_id=None, workspac
         state,
         output_chat_id=chat_id,
         delegated=True,
+        extra_env=requested_env or None,
     )
     return True
 
@@ -562,6 +596,7 @@ def route_prompt(chat_id, prompt, state):
 
 def dispatch_turn(
     chat_id, prompt, state, force_permission_mode=None, output_chat_id=None, delegated=False,
+    extra_env=None,
 ):
     """Write one prompt onto chat_id's persistent process. Non-blocking --
     see send_turn_to_chat_process's docstring. Delivery (final answer,
@@ -574,7 +609,10 @@ def dispatch_turn(
     model = get_model(state, settings_chat_id)
     permission_mode = force_permission_mode or get_permission_mode(state, settings_chat_id)
     workspace = get_workspace(state, settings_chat_id)
-    config_dir = account_dir(telegram_chat_id)
+    config_dir = account_dir(
+        telegram_chat_id,
+        state_key=chat_id if delegated else None,
+    )
 
     send_turn_to_chat_process(
         chat_id,
@@ -586,6 +624,7 @@ def dispatch_turn(
         config_dir,
         output_chat_id=telegram_chat_id,
         delegated=delegated,
+        extra_env=extra_env,
     )
 
 
